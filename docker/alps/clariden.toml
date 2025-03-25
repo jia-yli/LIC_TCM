@@ -1,0 +1,10 @@
+image = "/capstor/scratch/cscs/ljiayong/enroot_images/lic_tcm.sqsh"
+mounts = ["/capstor/scratch/cscs/ljiayong:/capstor/scratch/cscs/ljiayong",
+          "/users/ljiayong/projects/LIC_TCM:/users/ljiayong/projects/LIC_TCM",
+          ]
+workdir = "/users/ljiayong/projects/LIC_TCM"
+writable = true
+
+[env]
+NVIDIA_VISIBLE_DEVICES = "all"
+NVIDIA_DRIVER_CAPABILITIES = "compute,utility"
