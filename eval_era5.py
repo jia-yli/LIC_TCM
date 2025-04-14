@@ -227,8 +227,8 @@ class LicTcmCompressor:
     data_hat_scaled_lst = []
     for out_enc in results:
       with torch.no_grad():
-        out_dec = self.net.decompress(out_enc["strings"], out_enc["shape"])
         torch.cuda.synchronize()
+        out_dec = self.net.decompress(out_enc["strings"], out_enc["shape"])
         out_dec["x_hat"] = self.crop(out_dec["x_hat"], padding).mean(dim=-3)
         data_hat_scaled = out_dec["x_hat"].detach().cpu().numpy()
         data_hat_scaled_lst.append(data_hat_scaled)
@@ -246,141 +246,98 @@ class LicTcmCompressor:
   def run_benchmark(self, data, error_bound):
     # data, error_bound = data[0:5], error_bound[0:5]
 
+    print(f'[INFO] Starting Data Compression......')
     results, info = self.compress(data, clip_extreme=True)
     data_hat = self.decompress(results, info)
-
     error = np.abs(data - data_hat)
-    num_success_points = (error <= error_bound).sum()
+    num_failed_points = (error > error_bound).sum()
 
-    data_extreme_positions = info['data_extreme_positions']
-    num_extreme_positions = data_extreme_positions.size
-    print(f'[INFO] Extreme Ratio = {num_extreme_positions/data.size}')
-    success_ratio = num_success_points/data.size
-    print(f'[INFO] Success Ratio = {success_ratio}')
-
-    # residual
-    residual = data - data_hat
-    # residual[np.abs(residual) <= error_bound] = 0
-    results_residual, info_residual = self.compress(residual, clip_extreme=False)
-    residual_hat = self.decompress(results_residual, info_residual)
-
-    error_residual = np.abs(data - (data_hat + residual_hat))
-    num_success_points_residual = (error_residual <= error_bound).sum()
-
-    residual_extreme_positions = info['data_extreme_positions']
-    num_extreme_positions_residual = residual_extreme_positions.size
-    print(f'[INFO] Residual Extreme Ratio = {num_extreme_positions_residual/data.size}')
-    success_ratio_residual = num_success_points_residual/data.size
-    print(f'[INFO] Residual Success Ratio = {success_ratio_residual}')
-
-    residual_mask = error_residual > error_bound
-    residual_positions = np.flatnonzero(residual_mask)
-    residual_values = data[residual_mask]
-
-    output_file = f'./results/compressed.bin'
-    with open(output_file, 'wb') as f:
-      pickle.dump((results, info, results_residual, info_residual, residual_positions, residual_values), f)
-
-    comp_size_bytes = os.path.getsize(output_file)
-
-    estimated_comp_size_bytes = 0
+    current_info_bytes = (4 + 4) * len(info['data_extreme_positions'] + 1) + 4 * (1 + 1 + 4) # min, max, padding
+    current_data_bytes = 0
     for result in results:
       for s in result['strings']:
-        estimated_comp_size_bytes += len(s[0])
+        current_data_bytes += len(s[0])
+    current_failed_bytes = (4 + 4) * (num_failed_points+1)
+
+    best_compressed_bytes = current_info_bytes + current_data_bytes + current_failed_bytes
+    print(f'[INFO] current_info_bytes {current_info_bytes/1e6} MB, current_data_bytes {current_data_bytes/1e6} MB, current_failed_bytes {current_failed_bytes/1e6} MB')
+    current_data_hat = data_hat.copy()
+    current_compressed_bytes = current_info_bytes + current_data_bytes
+    num_residual_runs = 0
+    while True:
+      print(f'[INFO] Starting Residual Run {num_residual_runs + 1}')
+      # get new data_hat using extra residual compression
+      residual = data - current_data_hat
+      results_residual, info_residual = self.compress(residual, clip_extreme=False)
+      residual_hat = self.decompress(results_residual, info_residual)
+
+      current_data_hat = current_data_hat + residual_hat
+
+      data_extreme_positions = info['data_extreme_positions']
+      data_extreme_values = info['data_extreme_values']
+      data_extreme_mask = np.zeros(current_data_hat.shape, dtype=bool)
+      data_extreme_mask.flat[data_extreme_positions] = True
+      current_data_hat[data_extreme_mask] = data_extreme_values
+
+      error = np.abs(data - current_data_hat)
+      num_failed_points = (error > error_bound).sum()
+
+      current_info_bytes = 4 * (1 + 1 + 4) # min, max, padding
+      current_data_bytes = 0
+      for result in results_residual:
+        for s in result['strings']:
+          current_data_bytes += len(s[0])
+      current_failed_bytes = (4 + 4) * (num_failed_points+1)
+
+      current_compressed_bytes += current_info_bytes + current_data_bytes
+      print(f'[INFO] current_info_bytes {current_info_bytes/1e6} MB, current_data_bytes {current_data_bytes/1e6} MB, current_failed_bytes {current_failed_bytes/1e6} MB')
+      print(f'[INFO] current_compressed_bytes {current_compressed_bytes/1e6} MB, best_compressed_bytes {best_compressed_bytes/1e6} MB')
+      if (current_compressed_bytes + current_failed_bytes) < best_compressed_bytes:
+        best_compressed_bytes = current_compressed_bytes + current_failed_bytes
+        num_residual_runs += 1
+      else:
+        break
     
-    for result in results_residual:
-      for s in result['strings']:
-        estimated_comp_size_bytes += len(s[0])
+    print(f'[INFO] Estimated Compressed Size: {best_compressed_bytes/1e6} MB, using {num_residual_runs} residual runs')
 
-    print(f'[INFO] Compressed Size: {comp_size_bytes/1e6} MB, Estimated Size: {estimated_comp_size_bytes/1e6} MB')
+    return best_compressed_bytes
 
-    # compression ratio/time
-    import pdb;pdb.set_trace()
-    # p = 128
-
-    
-    # count = 0
-    # PSNR = 0
-    # Bit_rate = 0
-    # MS_SSIM = 0
-    # total_time = 0
-
-    # net.update()
-    # for img_name in img_list:
-    #     img_path = os.path.join(path, img_name)
-    #     img = transforms.ToTensor()(Image.open(img_path).convert('RGB')).to(device)
-    #     x = img.unsqueeze(0)
-    #     x_padded, padding = pad(x, p)
-    #     count += 1
-    #     with torch.no_grad():
-    #         if args.cuda:
-    #             torch.cuda.synchronize()
-    #         s = time.time()
-    #         out_enc = net.compress(x_padded)
-    #         out_dec = net.decompress(out_enc["strings"], out_enc["shape"])
-    #         if args.cuda:
-    #             torch.cuda.synchronize()
-    #         e = time.time()
-    #         total_time += (e - s)
-    #         out_dec["x_hat"] = crop(out_dec["x_hat"], padding)
-    #         num_pixels = x.size(0) * x.size(2) * x.size(3)
-    #         print(f'Bitrate: {(sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels):.3f}bpp')
-    #         print(f'MS-SSIM: {compute_msssim(x, out_dec["x_hat"]):.2f}dB')
-    #         print(f'PSNR: {compute_psnr(x, out_dec["x_hat"]):.2f}dB')
-    #         Bit_rate += sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels
-    #         PSNR += compute_psnr(x, out_dec["x_hat"])
-    #         MS_SSIM += compute_msssim(x, out_dec["x_hat"])
-    # PSNR = PSNR / count
-    # MS_SSIM = MS_SSIM / count
-    # Bit_rate = Bit_rate / count
-    # total_time = total_time / count
-    # print(f'average_PSNR: {PSNR:.2f}dB')
-    # print(f'average_MS-SSIM: {MS_SSIM:.4f}')
-    # print(f'average_Bit-rate: {Bit_rate:.3f} bpp')
-    # print(f'average_time: {total_time:.3f} ms')
 
 def compress_hdf5_lic_tcm_pointwise(input_hdf5, input_uncertainty_hdf5, output_hdf5, ebcc_pointwise_max_error_ratio, checkpoint_path):
   # compression and compression time
   compression_start_time = time.time()
+  
   with h5py.File(input_hdf5, 'r') as hdf5_in:
     with h5py.File(input_uncertainty_hdf5, 'r') as hdf5_uncertainty_in:
       with h5py.File(output_hdf5, 'w') as hdf5_out:
-        for var_name in hdf5_in.keys():
-          data = np.array(hdf5_in[var_name])  # Read dataset
-          error_bound = np.array(hdf5_uncertainty_in[var_name])
-          compressor = LicTcmCompressor(checkpoint_path)
-          compressor.run_benchmark(data, error_bound)
-          import pdb;pdb.set_trace()
+        assert len(list(hdf5_in.keys())) == 1
+        var_name = list(hdf5_in.keys())[0]
+        data = np.array(hdf5_in[var_name])  # Read dataset, 1 month data: (744, 721, 1440)
+        error_bound = np.array(hdf5_uncertainty_in[var_name]) * ebcc_pointwise_max_error_ratio
+        compressor = LicTcmCompressor(checkpoint_path)
+        best_compressed_bytes = compressor.run_benchmark(data, error_bound)
 
-    compression_end_time = time.time()
-    compression_time = compression_end_time - compression_start_time
+  compression_end_time = time.time()
+  compression_time = compression_end_time - compression_start_time
 
-  # decompreession time
-  decompression_start_time = time.time()
+  input_size = os.path.getsize(input_hdf5)
+  compression_ratio = input_size/best_compressed_bytes
+  compression_bandwidth = input_size/1e6/compression_time
 
-  with h5py.File(output_hdf5, 'r') as hdf5_out:
-    for dataset_name in hdf5_out.keys():
-      data = np.array(hdf5_out[dataset_name])
-
-  decompression_end_time = time.time()
-  decompression_time = decompression_end_time - decompression_start_time
-
-  return compression_time, decompression_time
+  return compression_time, compression_ratio, compression_bandwidth
 
 def run_lic_tcm_pointwise(output_path, variable, ebcc_pointwise_max_error_ratio, checkpoint_path):
   input_hdf5_file_path = os.path.join(output_path, f'{variable}.hdf5')
   input_uncertainty_file_path = os.path.join(output_path, f'{variable}_interpolated_ensemble_spread.hdf5')
   output_hdf5_file_path = os.path.join(output_path, f'{variable}_compressed_lic_tcm_pointwise_ratio_{ebcc_pointwise_max_error_ratio}.hdf5')
-  compression_time, decompression_time = compress_hdf5_lic_tcm_pointwise(input_hdf5_file_path, input_uncertainty_file_path, output_hdf5_file_path, ebcc_pointwise_max_error_ratio, checkpoint_path)
-  input_size = os.path.getsize(input_hdf5_file_path)
-  output_size = os.path.getsize(output_hdf5_file_path)
-  compression_ratio = input_size/output_size
+  compression_time, compression_ratio, compression_bandwidth = compress_hdf5_lic_tcm_pointwise(input_hdf5_file_path, input_uncertainty_file_path, output_hdf5_file_path, ebcc_pointwise_max_error_ratio, checkpoint_path)
   results = {
     'ebcc_pointwise_max_error_ratio' : ebcc_pointwise_max_error_ratio, 
     'compression_ratio' : compression_ratio,
     'compression_time' : compression_time,
-    'decompression_time' : decompression_time,
+    'compression_bandwidth': compression_bandwidth,
   }
+  import pdb;pdb.set_trace()
   return results
 
 if __name__ == '__main__':
