@@ -252,7 +252,7 @@ class LicTcmCompressor:
     error = np.abs(data - data_hat)
     num_failed_points = (error > error_bound).sum()
 
-    current_info_bytes = (4 + 4) * len(info['data_extreme_positions'] + 1) + 4 * (1 + 1 + 4) # min, max, padding
+    current_info_bytes = (4 + 4) * (len(info['data_extreme_positions']) + 1) + 4 * (1 + 1 + 4) # min, max, padding
     current_data_bytes = 0
     for result in results:
       for s in result['strings']:
@@ -300,7 +300,7 @@ class LicTcmCompressor:
     
     print(f'[INFO] Estimated Compressed Size: {best_compressed_bytes/1e6} MB, using {num_residual_runs} residual runs')
 
-    return best_compressed_bytes
+    return best_compressed_bytes, num_residual_runs, num_failed_points
 
 
 def compress_hdf5_lic_tcm_pointwise(input_hdf5, input_uncertainty_hdf5, output_hdf5, ebcc_pointwise_max_error_ratio, checkpoint_path):
@@ -315,7 +315,7 @@ def compress_hdf5_lic_tcm_pointwise(input_hdf5, input_uncertainty_hdf5, output_h
         data = np.array(hdf5_in[var_name])  # Read dataset, 1 month data: (744, 721, 1440)
         error_bound = np.array(hdf5_uncertainty_in[var_name]) * ebcc_pointwise_max_error_ratio
         compressor = LicTcmCompressor(checkpoint_path)
-        best_compressed_bytes = compressor.run_benchmark(data, error_bound)
+        best_compressed_bytes, num_residual_runs, num_failed_points = compressor.run_benchmark(data, error_bound)
 
   compression_end_time = time.time()
   compression_time = compression_end_time - compression_start_time
@@ -324,28 +324,29 @@ def compress_hdf5_lic_tcm_pointwise(input_hdf5, input_uncertainty_hdf5, output_h
   compression_ratio = input_size/best_compressed_bytes
   compression_bandwidth = input_size/1e6/compression_time
 
-  return compression_time, compression_ratio, compression_bandwidth
+  return compression_time, compression_ratio, compression_bandwidth, num_residual_runs, num_failed_points
 
 def run_lic_tcm_pointwise(output_path, variable, ebcc_pointwise_max_error_ratio, checkpoint_path):
   input_hdf5_file_path = os.path.join(output_path, f'{variable}.hdf5')
   input_uncertainty_file_path = os.path.join(output_path, f'{variable}_interpolated_ensemble_spread.hdf5')
   output_hdf5_file_path = os.path.join(output_path, f'{variable}_compressed_lic_tcm_pointwise_ratio_{ebcc_pointwise_max_error_ratio}.hdf5')
-  compression_time, compression_ratio, compression_bandwidth = compress_hdf5_lic_tcm_pointwise(input_hdf5_file_path, input_uncertainty_file_path, output_hdf5_file_path, ebcc_pointwise_max_error_ratio, checkpoint_path)
+  compression_time, compression_ratio, compression_bandwidth, num_residual_runs, num_failed_points = compress_hdf5_lic_tcm_pointwise(input_hdf5_file_path, input_uncertainty_file_path, output_hdf5_file_path, ebcc_pointwise_max_error_ratio, checkpoint_path)
   results = {
     'ebcc_pointwise_max_error_ratio' : ebcc_pointwise_max_error_ratio, 
     'compression_ratio' : compression_ratio,
     'compression_time' : compression_time,
     'compression_bandwidth': compression_bandwidth,
+    'num_residual_runs': num_residual_runs,
+    'num_failed_points': num_failed_points
   }
-  import pdb;pdb.set_trace()
   return results
 
 if __name__ == '__main__':
   variable_lst = [
     "10m_u_component_of_wind",
-    "10m_v_component_of_wind",
-    "2m_temperature",
-    "total_precipitation"
+    # "10m_v_component_of_wind",
+    # "2m_temperature",
+    # "total_precipitation"
   ]
 
   # global value
@@ -375,8 +376,8 @@ if __name__ == '__main__':
     '''
     Param Combinations
     '''
-    # ebcc_pointwise_max_error_ratio_lst = [0.1, 0.5, 1]
-    ebcc_pointwise_max_error_ratio_lst = [0.1]
+    ebcc_pointwise_max_error_ratio_lst = [0.1, 0.5, 1]
+    # ebcc_pointwise_max_error_ratio_lst = [0.1]
     checkpoint_path='/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/pretrained/lic_tcm_n_128_lambda_0.05.pth.tar'
 
     param_combinations = list(itertools.product([output_path], [variable], ebcc_pointwise_max_error_ratio_lst, [checkpoint_path]))
@@ -391,9 +392,9 @@ if __name__ == '__main__':
       results.append(run_lic_tcm_pointwise(*params))
     
     # Convert results to a structured DataFrame
-    # results_df = pd.DataFrame(results)
+    results_df = pd.DataFrame(results)
 
-    # results_df.to_csv(f'./results/{variable}_ebcc_pointwise_compression.csv', index=False)
+    results_df.to_csv(f'./results/{variable}_lic_tcm_pointwise_compression.csv', index=False)
 
     # '''
     # Step 4: Plot Compression Error Distribution

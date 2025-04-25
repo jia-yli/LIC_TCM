@@ -26,6 +26,6 @@ RUN pip install timm==1.0.9
 # RUN pip install lightgbm
 RUN pip install packaging
 RUN pip install netCDF4 xarray cartopy h5py bottleneck
-RUN pip install compressai
+RUN pip install compressai tensorboard
 
 ENTRYPOINT /bin/bash
