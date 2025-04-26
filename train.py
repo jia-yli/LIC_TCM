@@ -215,11 +215,11 @@ def valid_epoch(epoch, valid_dataloader, model, criterion, type='mse'):
 
 
 def save_checkpoint(state, is_best, epoch, save_path, filename):
-  torch.save(state, save_path + "checkpoint_latest.pth.tar")
+  torch.save(state, os.path.join(save_path, "checkpoint_latest.pth.tar"))
   if epoch % 5 == 0:
     torch.save(state, filename)
   if is_best:
-    torch.save(state, save_path + "checkpoint_best.pth.tar")
+    torch.save(state, os.path.join(save_path, "checkpoint_best.pth.tar"))
 
 
 def parse_args(argv):
@@ -323,11 +323,11 @@ def main(argv):
   save_path = os.path.join(args.save_path, str(args.lmbda))
   if not os.path.exists(save_path):
     os.makedirs(save_path)
-    os.makedirs(save_path + "tensorboard/")
+    os.makedirs(os.path.join(save_path, "tensorboard"))
   if args.seed is not None:
     torch.manual_seed(args.seed)
     random.seed(args.seed)
-  writer = SummaryWriter(save_path + "tensorboard/")
+  writer = SummaryWriter(os.path.join(save_path, "tensorboard"))
 
   train_transforms = transforms.Compose(
     [transforms.RandomCrop(args.patch_size), transforms.ToTensor()]
@@ -418,7 +418,7 @@ def main(argv):
         is_best,
         epoch,
         save_path,
-        save_path + str(epoch) + "_checkpoint.pth.tar",
+        os.path.join(save_path, f"{epoch}_checkpoint.pth.tar"),
       )
 
 

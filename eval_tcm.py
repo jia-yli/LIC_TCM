@@ -12,10 +12,10 @@ import time
 import warnings
 from pytorch_msssim import ms_ssim
 from PIL import Image
+from mmengine import Config
+import pandas as pd
+from tqdm import tqdm
 warnings.filterwarnings("ignore")
-
-print(torch.cuda.is_available())
-
 
 def compute_psnr(a, b):
   mse = torch.mean((a - b)**2).item()
@@ -52,27 +52,8 @@ def crop(x, padding):
     (-padding[0], -padding[1], -padding[2], -padding[3]),
   )
 
-def parse_args(argv):
-  parser = argparse.ArgumentParser(description="Example testing script.")
-  parser.add_argument("--cuda", action="store_true", help="Use cuda")
-  parser.add_argument(
-    "--clip_max_norm",
-    default=1.0,
-    type=float,
-    help="gradient clipping max norm (default: %(default)s",
-  )
-  parser.add_argument("--checkpoint", type=str, help="Path to a checkpoint")
-  parser.add_argument("--data", type=str, help="Path to dataset")
-  parser.add_argument(
-    "--real", action="store_true", default=True
-  )
-  parser.set_defaults(real=False)
-  args = parser.parse_args(argv)
-  return args
-
-
-def main(argv):
-  args = parse_args(argv)
+def eval_tcm(configs):
+  args = configs
   p = 128
   path = args.data
   img_list = []
@@ -83,13 +64,14 @@ def main(argv):
     device = 'cuda:0'
   else:
     device = 'cpu'
-  net = TCM(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=128, M=320)
+  net = TCM(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=64, M=320)
   net = net.to(device)
   net.eval()
   count = 0
   PSNR = 0
   Bit_rate = 0
   MS_SSIM = 0
+  compression_ratio = 0
   total_time = 0
   dictory = {}
   if args.checkpoint:  # load from previous checkpoint
@@ -100,7 +82,7 @@ def main(argv):
     net.load_state_dict(dictory)
   if args.real:
     net.update()
-    for img_name in img_list:
+    for img_name in tqdm(img_list):
       img_path = os.path.join(path, img_name)
       img = transforms.ToTensor()(Image.open(img_path).convert('RGB')).to(device)
       x = img.unsqueeze(0)
@@ -118,15 +100,16 @@ def main(argv):
         total_time += (e - s)
         out_dec["x_hat"] = crop(out_dec["x_hat"], padding)
         num_pixels = x.size(0) * x.size(2) * x.size(3)
-        print(f'Bitrate: {(sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels):.3f}bpp')
-        print(f'MS-SSIM: {compute_msssim(x, out_dec["x_hat"]):.2f}dB')
-        print(f'PSNR: {compute_psnr(x, out_dec["x_hat"]):.2f}dB')
+        # print(f'Bitrate: {(sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels):.3f}bpp')
+        # print(f'MS-SSIM: {compute_msssim(x, out_dec["x_hat"]):.2f}dB')
+        # print(f'PSNR: {compute_psnr(x, out_dec["x_hat"]):.2f}dB')
         Bit_rate += sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels
+        compression_ratio += num_pixels * 3 / sum(len(s[0]) for s in out_enc["strings"])
         PSNR += compute_psnr(x, out_dec["x_hat"])
         MS_SSIM += compute_msssim(x, out_dec["x_hat"])
 
   else:
-    for img_name in img_list:
+    for img_name in tqdm(img_list):
       img_path = os.path.join(path, img_name)
       img = Image.open(img_path).convert('RGB')
       x = transforms.ToTensor()(img).unsqueeze(0).to(device)
@@ -143,9 +126,9 @@ def main(argv):
         total_time += (e - s)
         out_net['x_hat'].clamp_(0, 1)
         out_net["x_hat"] = crop(out_net["x_hat"], padding)
-        print(f'PSNR: {compute_psnr(x, out_net["x_hat"]):.2f}dB')
-        print(f'MS-SSIM: {compute_msssim(x, out_net["x_hat"]):.2f}dB')
-        print(f'Bit-rate: {compute_bpp(out_net):.3f}bpp')
+        # print(f'PSNR: {compute_psnr(x, out_net["x_hat"]):.2f}dB')
+        # print(f'MS-SSIM: {compute_msssim(x, out_net["x_hat"]):.2f}dB')
+        # print(f'Bit-rate: {compute_bpp(out_net):.3f}bpp')
         PSNR += compute_psnr(x, out_net["x_hat"])
         MS_SSIM += compute_msssim(x, out_net["x_hat"])
         Bit_rate += compute_bpp(out_net)
@@ -153,13 +136,66 @@ def main(argv):
   MS_SSIM = MS_SSIM / count
   Bit_rate = Bit_rate / count
   total_time = total_time / count
-  print(f'average_PSNR: {PSNR:.2f}dB')
-  print(f'average_MS-SSIM: {MS_SSIM:.4f}')
-  print(f'average_Bit-rate: {Bit_rate:.3f} bpp')
-  print(f'average_time: {total_time:.3f} ms')
+  print(f'Avg PSNR: {PSNR:.2f}dB')
+  print(f'Avg MS-SSIM: {MS_SSIM:.4f}')
+  print(f'Avg Bit-rate: {Bit_rate:.3f} bpp')
+  print(f'Avg compress-decompress time: {total_time:.3f} ms')
+  result = {
+    "psnr": PSNR,
+    "ms_ssim": MS_SSIM,
+    "bit_rate": Bit_rate,
+    "total_time": total_time,
+  }
+  if args.real:
+    compression_ratio = compression_ratio / count
+    result["compression_ratio"] = compression_ratio
+    print(f'Avg compression ratio: {compression_ratio:.2f}')
+  return result
   
+def main():
+  print(f"{torch.cuda.is_available()=}")
+  '''
+  params
+  '''
+  datasets = {
+    "Kodak": "/capstor/scratch/cscs/ljiayong/datasets/kodak-kaggle",
+    "CLIC": "/capstor/scratch/cscs/ljiayong/datasets/CLIC_2021/test",
+  }
+  checkpoint_lst = [
+    "/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/pretrained/lic_tcm_n_64_lambda_0.0025.pth.tar",
+    "/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/pretrained/lic_tcm_n_64_lambda_0.0035.pth.tar",
+    "/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/pretrained/lic_tcm_n_64_lambda_0.0067.pth.tar",
+    "/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/pretrained/lic_tcm_n_64_lambda_0.013.pth.tar",
+    "/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/pretrained/lic_tcm_n_64_lambda_0.025.pth.tar",
+    "/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/pretrained/lic_tcm_n_64_lambda_0.05.pth.tar",
+    # "/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/pretrained/lic_tcm_n_128_lambda_0.05.pth.tar",
+  ]
+
+  '''
+  run eval
+  '''
+  results = []
+  for dataset_name in datasets:
+    for checkpoint in checkpoint_lst:
+      print(f"[INFO] Starting TCM eval on {dataset_name} dataset with checkpoint {checkpoint} ......")
+      eval_configs = Config({
+        "cuda" : True,
+        "checkpoint": checkpoint,
+        "data": datasets[dataset_name],
+        "real": True,
+      })
+      eval_metrics = eval_tcm(eval_configs)
+      result = {
+        "dataset_name": dataset_name,
+        "checkpoint": checkpoint,
+        **eval_metrics
+      }
+      results.append(result)
+  
+  df = pd.DataFrame(results)
+  df.to_csv("./results/eval_tcm.csv", index=False)
+
 
 if __name__ == "__main__":
-  print(torch.cuda.is_available())
-  main(sys.argv[1:])
+  main()
   
