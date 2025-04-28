@@ -14,7 +14,7 @@ from pytorch_msssim import ms_ssim
 from PIL import Image
 from mmengine import Config
 import pandas as pd
-from tqdm import tqdm
+import multiprocessing as mp
 warnings.filterwarnings("ignore")
 
 def compute_psnr(a, b):
@@ -29,6 +29,14 @@ def compute_bpp(out_net):
   num_pixels = size[0] * size[2] * size[3]
   return sum(torch.log(likelihoods).sum() / (-math.log(2) * num_pixels)
         for likelihoods in out_net['likelihoods'].values()).item()
+
+def compute_total_bytes(out_enc):
+  total_bytes = 0
+  for out_strs in out_enc["strings"]:
+    for out_str in out_strs:
+      assert isinstance(out_str, bytes)
+      total_bytes += len(out_str)
+  return total_bytes
 
 def pad(x, p):
   h, w = x.size(2), x.size(3)
@@ -54,6 +62,13 @@ def crop(x, padding):
 
 def eval_zoo(configs):
   args = configs
+  os.environ['CUBLAS_WORKSPACE_CONFIG'] = ":4096:8"
+  torch.use_deterministic_algorithms(True)
+  current_proc_name = mp.current_process().name
+  try:
+    worker_idx = int(current_proc_name.split('-')[-1]) % configs.num_gpus
+  except:
+    worker_idx = 0
   p = 128
   path = args.data
   img_list = []
@@ -61,7 +76,7 @@ def eval_zoo(configs):
     if file[-3:] in ["jpg", "png", "peg"]:
       img_list.append(file)
   if args.cuda:
-    device = 'cuda:0'
+    device = f'cuda:{worker_idx}'
   else:
     device = 'cpu'
   net = image_models[args.model](quality=args.quality_factor, pretrained=True)
@@ -74,8 +89,8 @@ def eval_zoo(configs):
   compression_ratio = 0
   total_time = 0
   if args.real:
-    # net.update()
-    for img_name in tqdm(img_list):
+    net.update()
+    for img_name in img_list:
       img_path = os.path.join(path, img_name)
       img = transforms.ToTensor()(Image.open(img_path).convert('RGB')).to(device)
       x = img.unsqueeze(0)
@@ -83,12 +98,12 @@ def eval_zoo(configs):
       count += 1
       with torch.no_grad():
         if args.cuda:
-          torch.cuda.synchronize()
+          torch.cuda.synchronize(device)
         s = time.time()
         out_enc = net.compress(x_padded)
         out_dec = net.decompress(out_enc["strings"], out_enc["shape"])
         if args.cuda:
-          torch.cuda.synchronize()
+          torch.cuda.synchronize(device)
         e = time.time()
         total_time += (e - s)
         out_dec["x_hat"] = crop(out_dec["x_hat"], padding)
@@ -96,13 +111,14 @@ def eval_zoo(configs):
         # print(f'Bitrate: {(sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels):.3f}bpp')
         # print(f'MS-SSIM: {compute_msssim(x, out_dec["x_hat"]):.2f}dB')
         # print(f'PSNR: {compute_psnr(x, out_dec["x_hat"]):.2f}dB')
-        Bit_rate += sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels
-        compression_ratio += num_pixels * 3 / sum(len(s[0]) for s in out_enc["strings"])
+        compressed_total_bytes = compute_total_bytes(out_enc)
+        Bit_rate += compressed_total_bytes * 8.0 / num_pixels
+        compression_ratio += num_pixels * 3 / compressed_total_bytes
         PSNR += compute_psnr(x, out_dec["x_hat"])
         MS_SSIM += compute_msssim(x, out_dec["x_hat"])
 
   else:
-    for img_name in tqdm(img_list):
+    for img_name in img_list:
       img_path = os.path.join(path, img_name)
       img = Image.open(img_path).convert('RGB')
       x = transforms.ToTensor()(img).unsqueeze(0).to(device)
@@ -110,11 +126,11 @@ def eval_zoo(configs):
       count += 1
       with torch.no_grad():
         if args.cuda:
-          torch.cuda.synchronize()
+          torch.cuda.synchronize(device)
         s = time.time()
         out_net = net.forward(x_padded)
         if args.cuda:
-          torch.cuda.synchronize()
+          torch.cuda.synchronize(device)
         e = time.time()
         total_time += (e - s)
         out_net['x_hat'].clamp_(0, 1)
@@ -129,11 +145,12 @@ def eval_zoo(configs):
   MS_SSIM = MS_SSIM / count
   Bit_rate = Bit_rate / count
   total_time = total_time / count
-  print(f'Avg PSNR: {PSNR:.2f}dB')
-  print(f'Avg MS-SSIM: {MS_SSIM:.4f}')
-  print(f'Avg Bit-rate: {Bit_rate:.3f} bpp')
-  print(f'Avg compress-decompress time: {total_time:.3f} ms')
+  # print(f'Avg PSNR: {PSNR:.2f}dB')
+  # print(f'Avg MS-SSIM: {MS_SSIM:.4f}')
+  # print(f'Avg Bit-rate: {Bit_rate:.3f} bpp')
+  # print(f'Avg compress-decompress time: {total_time:.3f} ms')
   result = {
+    "worker_idx": worker_idx,
     "psnr": PSNR,
     "ms_ssim": MS_SSIM,
     "bit_rate": Bit_rate,
@@ -142,11 +159,12 @@ def eval_zoo(configs):
   if args.real:
     compression_ratio = compression_ratio / count
     result["compression_ratio"] = compression_ratio
-    print(f'Avg compression ratio: {compression_ratio:.2f}')
+    # print(f'Avg compression ratio: {compression_ratio:.2f}')
   return result
   
 def main():
   print(f"{torch.cuda.is_available()=}")
+  print(f"{torch.cuda.device_count()=}")
   '''
   params
   '''
@@ -155,19 +173,23 @@ def main():
     "CLIC": "/capstor/scratch/cscs/ljiayong/datasets/CLIC_2021/test",
   }
   models = {
-    "Cheng[CVPR20]": "cheng2020-anchor",
-    "Minnen[NeurIPS18]": "mbt2018",
-    "Balle[ICLR18]": "bmshj2018-hyperprior",
+    "Cheng(CVPR20)": "cheng2020-anchor",
+    "Minnen(NeurIPS18)": "mbt2018",
+    "Balle(ICLR18)": "bmshj2018-hyperprior",
   }
   quality_factors = {
-    "Cheng[CVPR20]": [1, 2, 3, 4, 5, 6],
-    "Minnen[NeurIPS18]": [1, 2, 3, 4, 5, 6, 7, 8],
-    "Balle[ICLR18]": [1, 2, 3, 4, 5, 6, 7, 8],
+    "Cheng(CVPR20)": [1, 2, 3, 4, 5, 6],
+    "Minnen(NeurIPS18)": [1, 2, 3, 4, 5, 6, 7, 8],
+    "Balle(ICLR18)": [1, 2, 3, 4, 5, 6, 7, 8],
   }
 
   '''
   run eval
   '''
+  num_gpus = torch.cuda.device_count()
+  # num_gpus = 1
+  ctx = mp.get_context('spawn')
+  pool = ctx.Pool(processes=num_gpus)
   results = []
   for dataset_name in datasets:
     for model_name in models:
@@ -177,20 +199,48 @@ def main():
           "model": models[model_name],
           "quality_factor": quality_factor,
           "cuda" : True,
+          "num_gpus": num_gpus,
           "data": datasets[dataset_name],
           "real": True,
         })
-        eval_metrics = eval_zoo(eval_configs)
+        if num_gpus > 1:
+          eval_metrics = pool.apply_async(eval_zoo, args = (eval_configs,))
+        else:
+          eval_metrics = eval_zoo(eval_configs)
         result = {
           "dataset_name": dataset_name,
           "model_name": model_name,
           "quality_factor": quality_factor,
-          **eval_metrics
+          "eval_metrics": eval_metrics,
         }
         results.append(result)
+
+  pool.close()
+  # pool.join()
+
+  for idx in range(len(results)):
+    async_result = results[idx]
+    print(f"[INFO] Waiting {async_result['model_name']} eval on {async_result['dataset_name']} dataset with quality factor {async_result['quality_factor']} ......")
+    if num_gpus > 1:
+      result = {
+        "dataset_name": async_result["dataset_name"],
+        "model_name": async_result["model_name"],
+        "quality_factor": async_result["quality_factor"],
+        **(async_result["eval_metrics"].get()),
+      }
+    else:
+      result = {
+        "dataset_name": async_result["dataset_name"],
+        "model_name": async_result["model_name"],
+        "quality_factor": async_result["quality_factor"],
+        **(async_result["eval_metrics"]),
+      }
+    
+    results[idx] = result
+    df = pd.DataFrame(results[:idx+1])
+    df.to_csv("./results/eval_zoo.csv", index=False)
   
-  df = pd.DataFrame(results)
-  df.to_csv("./results/eval_zoo.csv", index=False)
+  pool.join()
 
 
 if __name__ == "__main__":
