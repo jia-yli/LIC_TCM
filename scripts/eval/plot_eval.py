@@ -9,12 +9,11 @@ def draw_plot(x_name, x_unit, y_name, y_unit):
   Preparation
   '''
   # TCM models
-  df_tcm = pd.read_csv('/users/ljiayong/projects/LIC_TCM/results/eval_tcm_kodak.csv')
+  df_tcm = pd.read_csv('/users/ljiayong/projects/LIC_TCM/results/eval_tcm.csv')
   # baseline from zoo
-  df_zoo = pd.read_csv('/users/ljiayong/projects/LIC_TCM/results/eval_zoo_kodak.csv')
+  df_zoo = pd.read_csv('/users/ljiayong/projects/LIC_TCM/results/eval_zoo.csv')
 
-  # dataset_lst = ['Kodak', 'CLIC']
-  dataset_lst = ['Kodak']
+  dataset_lst = ['Kodak', 'CLIC']
 
   '''
   Draw

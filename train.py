@@ -320,7 +320,7 @@ def main(argv):
   for arg in vars(args):
     print(arg, ":", getattr(args, arg))
   type = args.type
-  save_path = os.path.join(args.save_path, str(args.lmbda))
+  save_path = os.path.join(args.save_path, f"N_{args.N}_lambda_{str(args.lmbda)}")
   if not os.path.exists(save_path):
     os.makedirs(save_path)
     os.makedirs(os.path.join(save_path, "tensorboard"))
@@ -375,15 +375,19 @@ def main(argv):
   criterion = RateDistortionLoss(lmbda=args.lmbda, type=type)
 
   last_epoch = 0
-  if args.checkpoint:  # load from previous checkpoint
-    print("Loading", args.checkpoint)
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+  default_checkpoint_path = os.path.join(save_path, "checkpoint_latest.pth.tar")
+  if args.checkpoint or os.path.exists(default_checkpoint_path):  # load from previous checkpoint
+    checkpoint_path = args.checkpoint
+    if checkpoint_path is None:
+      checkpoint_path = default_checkpoint_path
+    checkpoint = torch.load(checkpoint_path, map_location=device)
     net.load_state_dict(checkpoint["state_dict"])
     if args.continue_train:
       last_epoch = checkpoint["epoch"] + 1
       optimizer.load_state_dict(checkpoint["optimizer"])
       aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
       lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+    print(f"Loaded {checkpoint_path} and continue train from epoch {last_epoch}, ({args.continue_train=})")
 
   best_loss = float("inf")
   for epoch in range(last_epoch, args.epochs):

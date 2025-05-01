@@ -38,6 +38,8 @@ ENV_VARS="
 srun --environment=/users/ljiayong/projects/LIC_TCM/docker/alps/clariden.toml bash -c "
   ${ENV_VARS}
   # pip install -e .
-  python ./eval_tcm.py
-  python ./eval_zoo.py
+  # python ./eval_tcm.py
+  # python ./eval_zoo.py
+  # python ./eval_tcm_era5.py
+  python ./eval_zoo_era5.py
 "
