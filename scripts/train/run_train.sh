@@ -8,8 +8,8 @@ for i in "${!lambdas[@]}"; do
 
   echo "Launching training on GPU $gpu_id with lambda $lambda"
 
-  CUDA_VISIBLE_DEVICES=$gpu_id python -u ${SCRIPT_DIR}/../../train.py -d /capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/datasets/imagenet_256_300000 \
-    --cuda --N 128 --lambda $lambda --epochs 50 --lr_epoch 45 48 \
+  CUDA_VISIBLE_DEVICES=$gpu_id python -u ${SCRIPT_DIR}/../../train_era5.py -d /capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/datasets/imagenet_256_50000 \
+    --cuda --N 128 --lambda $lambda --epochs 20 --lr_epoch 15 18 \
     --save_path /capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/checkpoints --save &
 
 done

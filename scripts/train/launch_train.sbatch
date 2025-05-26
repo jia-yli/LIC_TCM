@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --account=g34                   # account to use
+#SBATCH --account=a-g34                   # account to use
 #SBATCH --job-name=lic-tcm-train             # Job name
 #SBATCH --output=./slurm_out/job_%j_out.txt   # Output file (job ID and task number)
 #SBATCH --error=./slurm_out/job_%j_err.txt    # Error file (job ID and task number)
@@ -9,7 +9,7 @@
 #SBATCH --cpus-per-task=128               # Number of CPU cores per task
 #SBATCH --mem=256G                        # Memory allocation
 #SBATCH --gpus=4                          # Number of GPUs
-#SBATCH --time=24:00:00                    # Time limit
+#SBATCH --time=12:00:00                    # Time limit
 
 # Print detailed job metadata
 JOB_TIME_LIMIT=$(squeue -j $SLURM_JOB_ID -h --Format TimeLimit)

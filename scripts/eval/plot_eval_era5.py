@@ -36,19 +36,19 @@ def draw_plot(x_name, x_unit, y_name, y_unit):
         label=f"LIC_TCM-{tcm_n}(CVPR23)"
       )
     
-    # '''
-    # Zoo Models
-    # '''
-    # model_name_lst = df_zoo['model_name'].unique()
-    # for model_name in model_name_lst:
-    #   model_data = df_zoo[(df_zoo['dataset_name']==dataset_name) & (df_zoo['model_name']==model_name)].sort_values('quality_factor')
-    #   plt.plot(
-    #     model_data[x_name], 
-    #     model_data[y_name], 
-    #     marker='o',
-    #     markersize=4, 
-    #     label=f"{model_name}"
-    #   )
+    '''
+    Zoo Models
+    '''
+    model_name_lst = df_zoo[(df_zoo['variable']==variable)]['model_name'].unique()
+    for model_name in model_name_lst:
+      model_data = df_zoo[(df_zoo['variable']==variable) & (df_zoo['model_name']==model_name)].sort_values('quality_factor')
+      plt.plot(
+        model_data[x_name], 
+        model_data[y_name], 
+        marker='o',
+        markersize=4, 
+        label=f"{model_name}"
+      )
 
     '''
     Metric Target Values

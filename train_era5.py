@@ -17,9 +17,150 @@ from pytorch_msssim import ms_ssim
 from models import TCM
 from torch.utils.tensorboard import SummaryWriter   
 import os
+import xarray as xr
+import numpy as np
+from torch.utils.data import Dataset
+import torch.nn.functional as F
+import itertools
 
 torch.backends.cudnn.deterministic=True
 torch.backends.cudnn.benchmark=False
+
+class Era5ReanalysisDataset:
+  def __init__(self, variable, batch_size, patch_size=256, split='train'):
+    # configs
+    self.variable = variable
+    self.batch_size = batch_size
+    self.patch_size = patch_size
+    self.split = split
+    self.era5_root = "/capstor/scratch/cscs/ljiayong/datasets/ERA5_large"
+    if split == 'train':
+      self.year_lst = [str(y) for y in range(2015, 2023)]
+      # self.year_lst = [str(y) for y in range(2015, 2016)]
+    elif split == 'valid':
+      self.year_lst = [str(y) for y in range(2023, 2024)]
+    elif split == 'test':
+      self.year_lst = [str(y) for y in range(2024, 2025)]
+    else:
+      raise ValueError(f"Unsupported dataset split: {split}")
+    self.month_lst = ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"]
+
+    # other params
+    # self.n_samples = 0
+    # self.n_files = 0
+    # for year in self.year_lst:
+    #   for month in self.month_lst:
+    #     reanalysis_file = os.path.join(self.era5_root, f"single_level/reanalysis/{year}/{month}/{variable}.nc")
+    #     reanalysis_dataset = xr.open_dataset(reanalysis_file)
+    #     assert len(reanalysis_dataset.data_vars) == 1
+    #     data_array = reanalysis_dataset[list(reanalysis_dataset.data_vars)[0]].values
+    #     self.n_sample += data_array.shape[0]
+    #     self.n_files += 1
+
+    # states
+    self._start_new_epoch() # reset states
+    self._load_next_file() # load data
+  
+  def _start_new_epoch(self):
+    self.remaining_files = list(itertools.product(self.year_lst, self.month_lst))
+    if self.split == 'train':
+      random.shuffle(self.remaining_files)
+    # states
+    self.current_file = None
+    self.current_data = None
+    self.current_normalize_min = None
+    self.current_normalize_max = None
+    self.n_samples = None
+    self.access_indices = None
+    self.current_start_idx = None
+
+  def _load_next_file(self):
+    is_epoch_finished = False
+    if not self.remaining_files:
+      self._start_new_epoch()
+      is_epoch_finished = True
+
+    self.current_file = self.remaining_files.pop()
+    year, month = self.current_file
+    reanalysis_file = os.path.join(self.era5_root, f"single_level/reanalysis/{year}/{month}/{self.variable}.nc")
+    reanalysis_dataset = xr.open_dataset(reanalysis_file)
+    assert len(reanalysis_dataset.data_vars) == 1
+    self.current_data = reanalysis_dataset[list(reanalysis_dataset.data_vars)[0]].values
+    self.n_samples = self.current_data.shape[0]
+    # normalize
+    self.current_normalize_min = np.min(self.current_data, axis=(-1, -2), keepdims=True)
+    self.current_normalize_max = np.max(self.current_data, axis=(-1, -2), keepdims=True)
+    assert (self.current_normalize_min != self.current_normalize_max).all()
+    self.current_data = (self.current_data - self.current_normalize_min) / (self.current_normalize_max - self.current_normalize_min)
+
+    if self.split == 'train':
+      self.access_indices = np.random.permutation(self.n_samples)
+    else:
+      self.access_indices = np.arange(self.n_samples)
+    self.current_start_idx = 0
+
+    return is_epoch_finished
+
+  def _sample_batch(self, batch_size):
+    # select batch
+    n_remaining = self.n_samples - self.current_start_idx
+    n_take = min(n_remaining, batch_size)
+    selected_idx = self.access_indices[self.current_start_idx : self.current_start_idx + n_take]
+    self.current_start_idx = self.current_start_idx + n_take
+
+    # select patch
+    if self.split == 'train':
+      h = self.current_data.shape[-2]
+      w = self.current_data.shape[-1]
+      assert h >= self.patch_size
+      assert w >= self.patch_size
+      h_start_idx = np.random.randint(0, h - self.patch_size + 1, size = n_take)
+      w_start_idx = np.random.randint(0, w - self.patch_size + 1, size = n_take)
+
+      # idx 2D shape [n_take, patch_size]
+      h_idx = h_start_idx[:, np.newaxis] + np.arange(self.patch_size)[np.newaxis, :]
+      w_idx = w_start_idx[:, np.newaxis] + np.arange(self.patch_size)[np.newaxis, :]
+
+      selected_data = self.current_data[selected_idx[:, np.newaxis, np.newaxis], h_idx[:, :, np.newaxis], w_idx[:, np.newaxis, :]]
+    else:
+      selected_data = self.current_data[selected_idx]
+
+    selected_data_min = self.current_normalize_min[selected_idx]
+    selected_data_max = self.current_normalize_max[selected_idx]
+
+    if self.current_start_idx == self.n_samples:
+      is_file_finished = True
+    else:
+      is_file_finished = False
+
+    return selected_data, selected_data_min, selected_data_max, is_file_finished
+
+  def sample_batch(self):
+    batch_data = []
+    normalize_min = []
+    normalize_max = []
+    current_batch_size = 0
+    is_epoch_finished = False
+    while current_batch_size < self.batch_size:
+      selected_data, selected_data_min, selected_data_max, is_file_finished = self._sample_batch(self.batch_size)
+      batch_size = len(selected_data)
+
+      batch_data.append(selected_data)
+      normalize_min.append(selected_data_min)
+      normalize_max.append(selected_data_max)
+      current_batch_size += batch_size
+
+      # need more data for current batch
+      if is_file_finished:
+        is_epoch_finished = self._load_next_file()
+        if is_epoch_finished:
+          break
+
+    batch_data_array = np.concatenate(batch_data, axis=0)  # shape [b, h, w]
+    normalize_min_array = np.concatenate(normalize_min, axis=0)  # shape [b, h, w]
+    normalize_max_array = np.concatenate(normalize_max, axis=0)  # shape [b, h, w]
+    is_full_batch = current_batch_size == self.batch_size
+    return batch_data_array, normalize_min_array, normalize_max_array, is_full_batch, is_epoch_finished
 
 def compute_msssim(a, b):
   return ms_ssim(a, b, data_range=1.)
@@ -111,6 +252,27 @@ def configure_optimizers(net, args):
   )
   return optimizer, aux_optimizer
 
+def pad(x, p):
+  h, w = x.size(2), x.size(3)
+  new_h = (h + p - 1) // p * p
+  new_w = (w + p - 1) // p * p
+  padding_left = (new_w - w) // 2
+  padding_right = new_w - w - padding_left
+  padding_top = (new_h - h) // 2
+  padding_bottom = new_h - h - padding_top
+  x_padded = F.pad(
+    x,
+    (padding_left, padding_right, padding_top, padding_bottom),
+    mode="constant",
+    value=0,
+  )
+  return x_padded, (padding_left, padding_right, padding_top, padding_bottom)
+
+def crop(x, padding):
+  return F.pad(
+    x,
+    (-padding[0], -padding[1], -padding[2], -padding[3]),
+  )
 
 def train_one_epoch(
   model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, type='mse'
@@ -118,12 +280,20 @@ def train_one_epoch(
   model.train()
   device = next(model.parameters()).device
 
-  for i, d in enumerate(train_dataloader):
-    d = d.to(device)
+  # for i, d in enumerate(train_dataloader):
+  i = 0
+  while True:
+    batch_data_array, normalize_min_array, normalize_max_array, is_full_batch, is_epoch_finished = train_dataloader.sample_batch()
+    if not is_full_batch:
+      assert is_epoch_finished
+      break
+    d = torch.Tensor(batch_data_array).float().to(device)
+    d = d.unsqueeze(1).repeat(1, 3, 1, 1)
     optimizer.zero_grad()
     aux_optimizer.zero_grad()
 
     out_net = model(d)
+    out_net["x_hat"] = out_net["x_hat"].mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
 
     out_criterion = criterion(out_net, d)
     out_criterion["loss"].backward()
@@ -135,12 +305,11 @@ def train_one_epoch(
     aux_loss.backward()
     aux_optimizer.step()
 
-    if i % 1000 == 0:
+    if i % 100 == 0:
       if type == 'mse':
         print(
           f"Train epoch {epoch}: ["
-          f"{i*len(d)}/{len(train_dataloader.dataset)}"
-          f" ({100. * i / len(train_dataloader):.0f}%)]"
+          f"{i*len(d)} Samples]"
           f'\tLoss: {out_criterion["loss"].item():.3f} |'
           f'\tMSE loss: {out_criterion["mse_loss"].item():.3f} |'
           f'\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |'
@@ -149,14 +318,15 @@ def train_one_epoch(
       else:
         print(
           f"Train epoch {epoch}: ["
-          f"{i*len(d)}/{len(train_dataloader.dataset)}"
-          f" ({100. * i / len(train_dataloader):.0f}%)]"
+          f"{i*len(d)} Samples]"
           f'\tLoss: {out_criterion["loss"].item():.3f} |'
           f'\tMS_SSIM loss: {out_criterion["ms_ssim_loss"].item():.3f} |'
           f'\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |'
           f"\tAux loss: {aux_loss.item():.2f}"
         )
-
+    i += 1
+    if is_epoch_finished:
+      break
 
 def valid_epoch(epoch, valid_dataloader, model, criterion, type='mse'):
   model.eval()
@@ -168,15 +338,22 @@ def valid_epoch(epoch, valid_dataloader, model, criterion, type='mse'):
     aux_loss = AverageMeter()
 
     with torch.no_grad():
-      for d in valid_dataloader:
-        d = d.to(device)
-        out_net = model(d)
+      while True:
+        batch_data_array, normalize_min_array, normalize_max_array, is_full_batch, is_epoch_finished = valid_dataloader.sample_batch()
+        d = torch.Tensor(batch_data_array).float().to(device)
+        d = d.unsqueeze(1).repeat(1, 3, 1, 1)
+        d_padded, padding = pad(d, 128)
+        out_net = model(d_padded)
+        out_net["x_hat"] = out_net["x_hat"].mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
+        out_net["x_hat"] = crop(out_net["x_hat"], padding)
         out_criterion = criterion(out_net, d)
 
         aux_loss.update(model.aux_loss())
         bpp_loss.update(out_criterion["bpp_loss"])
         loss.update(out_criterion["loss"])
         mse_loss.update(out_criterion["mse_loss"])
+        if is_epoch_finished:
+          break
 
     print(
       f"Valid epoch {epoch}: Average losses:"
@@ -193,15 +370,22 @@ def valid_epoch(epoch, valid_dataloader, model, criterion, type='mse'):
     aux_loss = AverageMeter()
 
     with torch.no_grad():
-      for d in valid_dataloader:
-        d = d.to(device)
-        out_net = model(d)
+      while True:
+        batch_data_array, normalize_min_array, normalize_max_array, is_full_batch, is_epoch_finished = valid_dataloader.sample_batch()
+        d = torch.Tensor(batch_data_array).float().to(device)
+        d = d.unsqueeze(1).repeat(1, 3, 1, 1)
+        d_padded, padding = pad(d, 128)
+        out_net = model(d_padded)
+        out_net["x_hat"] = out_net["x_hat"].mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
+        out_net["x_hat"] = crop(out_net["x_hat"], padding)
         out_criterion = criterion(out_net, d)
 
         aux_loss.update(model.aux_loss())
         bpp_loss.update(out_criterion["bpp_loss"])
         loss.update(out_criterion["loss"])
         ms_ssim_loss.update(out_criterion["ms_ssim_loss"])
+        if is_epoch_finished:
+          break
 
     print(
       f"Valid epoch {epoch}: Average losses:"
@@ -329,37 +513,19 @@ def main(argv):
     random.seed(args.seed)
   writer = SummaryWriter(os.path.join(save_path, "tensorboard"))
 
-  train_transforms = transforms.Compose(
-    [transforms.RandomCrop(args.patch_size), transforms.ToTensor()]
-  )
+  os.environ['CUBLAS_WORKSPACE_CONFIG'] = ":4096:8"
+  torch.use_deterministic_algorithms(True)
+  # datasets
+  variable = "10m_u_component_of_wind"
+  train_dataset = Era5ReanalysisDataset(variable=variable, batch_size=8, patch_size=256, split='train')
+  valid_dataset = Era5ReanalysisDataset(variable=variable, batch_size=8, split='valid')
 
-  valid_transforms = transforms.Compose(
-    [transforms.CenterCrop(args.patch_size), transforms.ToTensor()]
-  )
 
+  device = 'cuda:0'
 
-  train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
-  valid_dataset = ImageFolder(args.dataset, split="valid", transform=valid_transforms)
+  train_dataloader = train_dataset
 
-  device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
-  print(device)
-  device = 'cuda'
-
-  train_dataloader = DataLoader(
-    train_dataset,
-    batch_size=args.batch_size,
-    num_workers=args.num_workers,
-    shuffle=True,
-    pin_memory=(device == "cuda"),
-  )
-
-  valid_dataloader = DataLoader(
-    valid_dataset,
-    batch_size=args.valid_batch_size,
-    num_workers=args.num_workers,
-    shuffle=False,
-    pin_memory=(device == "cuda"),
-  )
+  valid_dataloader = valid_dataset
 
   net = TCM(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=args.N, M=320)
   net = net.to(device)
