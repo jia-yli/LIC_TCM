@@ -109,7 +109,7 @@ class Era5ReanalysisDataset:
     self.current_start_idx = self.current_start_idx + n_take
 
     # select patch
-    if self.split == 'train':
+    if (self.split == 'train') and (self.patch_size > 0):
       h = self.current_data.shape[-2]
       w = self.current_data.shape[-1]
       assert h >= self.patch_size
@@ -292,8 +292,10 @@ def train_one_epoch(
     optimizer.zero_grad()
     aux_optimizer.zero_grad()
 
-    out_net = model(d)
+    d_padded, padding = pad(d, 128)
+    out_net = model(d_padded)
     out_net["x_hat"] = out_net["x_hat"].mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
+    out_net["x_hat"] = crop(out_net["x_hat"], padding)
 
     out_criterion = criterion(out_net, d)
     out_criterion["loss"].backward()
@@ -463,8 +465,7 @@ def parse_args(argv):
   parser.add_argument(
     "--patch-size",
     type=int,
-    nargs=2,
-    default=(256, 256),
+    default=256,
     help="Size of the patches to be cropped (default: %(default)s)",
   )
   parser.add_argument("--cuda", action="store_true", help="Use cuda")
@@ -517,7 +518,7 @@ def main(argv):
   torch.use_deterministic_algorithms(True)
   # datasets
   variable = "10m_u_component_of_wind"
-  train_dataset = Era5ReanalysisDataset(variable=variable, batch_size=8, patch_size=256, split='train')
+  train_dataset = Era5ReanalysisDataset(variable=variable, batch_size=args.batch_size, patch_size=args.patch_size, split='train')
   valid_dataset = Era5ReanalysisDataset(variable=variable, batch_size=8, split='valid')
 
 
