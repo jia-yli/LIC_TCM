@@ -310,7 +310,7 @@ def train_one_epoch(
     if i % 100 == 0:
       if type == 'mse':
         print(
-          f"Train epoch {epoch}: ["
+          f"Lambda {criterion.lmbda} Train epoch {epoch}: ["
           f"{i*len(d)} Samples]"
           f'\tLoss: {out_criterion["loss"].item():.3f} |'
           f'\tMSE loss: {out_criterion["mse_loss"].item():.3f} |'
@@ -319,7 +319,7 @@ def train_one_epoch(
         )
       else:
         print(
-          f"Train epoch {epoch}: ["
+          f"Lambda {criterion.lmbda} Train epoch {epoch}: ["
           f"{i*len(d)} Samples]"
           f'\tLoss: {out_criterion["loss"].item():.3f} |'
           f'\tMS_SSIM loss: {out_criterion["ms_ssim_loss"].item():.3f} |'
@@ -402,8 +402,8 @@ def valid_epoch(epoch, valid_dataloader, model, criterion, type='mse'):
 
 def save_checkpoint(state, is_best, epoch, save_path, filename):
   torch.save(state, os.path.join(save_path, "checkpoint_latest.pth.tar"))
-  if epoch % 5 == 0:
-    torch.save(state, filename)
+  # if epoch % 5 == 0:
+  torch.save(state, filename)
   if is_best:
     torch.save(state, os.path.join(save_path, "checkpoint_best.pth.tar"))
 
@@ -477,7 +477,7 @@ def parse_args(argv):
   )
   parser.add_argument(
     "--clip_max_norm",
-    default=1.0,
+    default=0.2,
     type=float,
     help="gradient clipping max norm (default: %(default)s",
   )
@@ -494,7 +494,7 @@ def parse_args(argv):
     "--lr_epoch", nargs='+', type=int
   )
   parser.add_argument(
-    "--continue_train", action="store_true", default=True
+    "--continue-train", action="store_true"
   )
   args = parser.parse_args(argv)
   return args
@@ -554,6 +554,18 @@ def main(argv):
       optimizer.load_state_dict(checkpoint["optimizer"])
       aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
       lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+    else:
+      if args.save:
+        save_checkpoint(
+          {
+            "epoch": -1,
+            "state_dict": net.state_dict(),
+          },
+          False,
+          -1,
+          save_path,
+          os.path.join(save_path, f"-1_checkpoint.pth.tar"),
+        )
     print(f"Loaded {checkpoint_path} and continue train from epoch {last_epoch}, ({args.continue_train=})")
 
   best_loss = float("inf")

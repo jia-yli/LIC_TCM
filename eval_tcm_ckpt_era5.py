@@ -212,120 +212,131 @@ def eval_tcm_era5(configs):
     worker_idx = 0
   p = 128
 
-  # datasets
-  variable = args.variable
-  valid_dataset = Era5ReanalysisDataset(variable=variable, batch_size=1, split='valid')
-  valid_dataloader = valid_dataset
+  try:
+    # datasets
+    variable = args.variable
+    valid_dataset = Era5ReanalysisDataset(variable=variable, batch_size=1, split='valid')
+    valid_dataloader = valid_dataset
 
-  if args.cuda:
-    device = f'cuda:{worker_idx}'
-  else:
-    device = 'cpu'
-  net = TCM(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=int(configs.n), M=320)
-  net = net.to(device)
-  net.eval()
-  count = 0
-  PSNR = 0
-  Bit_rate = 0
-  MS_SSIM = 0
-  compression_ratio = 0
-  total_time = 0
-  dictory = {}
-  if args.checkpoint:  # load from previous checkpoint
-    print("Loading", args.checkpoint)
-    checkpoint = torch.load(args.checkpoint, map_location=device)
-    for k, v in checkpoint["state_dict"].items():
-      dictory[k.replace("module.", "")] = v
-    net.load_state_dict(dictory)
-  if args.real:
-    net.update()
-    while True:
-      batch_data_array, normalize_min_array, normalize_max_array, is_full_batch, is_epoch_finished = valid_dataloader.sample_batch()
-      x = torch.Tensor(batch_data_array).float().to(device)
-      x = x.unsqueeze(1).repeat(1, 3, 1, 1)
-      x_padded, padding = pad(x, p)
-      count += 1
-      with torch.no_grad():
-        if args.cuda:
-          torch.cuda.synchronize(device)
-        s = time.time()
-        out_enc = net.compress(x_padded)
-        out_dec = net.decompress(out_enc["strings"], out_enc["shape"])
-        if args.cuda:
-          torch.cuda.synchronize(device)
-        e = time.time()
-        total_time += (e - s)
-        out_dec["x_hat"] = out_dec["x_hat"].mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
-        out_dec["x_hat"] = crop(out_dec["x_hat"], padding)
-        num_pixels = x.size(0) * x.size(2) * x.size(3)
-        # print(f'Bitrate: {(sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels):.3f}bpp')
-        # print(f'MS-SSIM: {compute_msssim(x, out_dec["x_hat"]):.2f}dB')
-        # print(f'PSNR: {compute_psnr(x, out_dec["x_hat"]):.2f}dB')
-        compressed_total_bytes = compute_total_bytes(out_enc)
-        Bit_rate += compressed_total_bytes * 8.0 / num_pixels
-        compression_ratio += num_pixels * 3 / compressed_total_bytes
-        PSNR += compute_psnr(x, out_dec["x_hat"])
-        MS_SSIM += compute_msssim(x, out_dec["x_hat"])
-        # '''
-        # Visualization
-        # '''
-        # image_name = os.path.basename(img_path)
-        # if image_name in ["kodim04.png", "kodim12.png"]:
-        #   error = torch.abs(x - out_dec["x_hat"])
-        #   hat_img = transforms.ToPILImage()(out_dec["x_hat"].squeeze(0).cpu())
-        #   error_img = transforms.ToPILImage()((error*10).clamp(0,1).squeeze(0).cpu())
-        #   Image.open(img_path).convert('RGB').save(f"./results/{image_name}")
-        #   hat_img.save(f"./results/hat_{image_name}")
-        #   error_img.save(f"./results/error_{image_name}")
-      if is_epoch_finished:
-        break
+    if args.cuda:
+      device = f'cuda:{worker_idx}'
+    else:
+      device = 'cpu'
+    net = TCM(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=int(configs.n), M=320)
+    net = net.to(device)
+    net.eval()
+    count = 0
+    PSNR = 0
+    Bit_rate = 0
+    MS_SSIM = 0
+    compression_ratio = 0
+    total_time = 0
+    dictory = {}
+    if args.checkpoint:  # load from previous checkpoint
+      print("Loading", args.checkpoint)
+      checkpoint = torch.load(args.checkpoint, map_location=device)
+      for k, v in checkpoint["state_dict"].items():
+        dictory[k.replace("module.", "")] = v
+      net.load_state_dict(dictory)
+    if args.real:
+      net.update()
+      while True:
+        batch_data_array, normalize_min_array, normalize_max_array, is_full_batch, is_epoch_finished = valid_dataloader.sample_batch()
+        x = torch.Tensor(batch_data_array).float().to(device)
+        x = x.unsqueeze(1).repeat(1, 3, 1, 1)
+        x_padded, padding = pad(x, p)
+        count += 1
+        with torch.no_grad():
+          if args.cuda:
+            torch.cuda.synchronize(device)
+          s = time.time()
+          out_enc = net.compress(x_padded)
+          out_dec = net.decompress(out_enc["strings"], out_enc["shape"])
+          if args.cuda:
+            torch.cuda.synchronize(device)
+          e = time.time()
+          total_time += (e - s)
+          out_dec["x_hat"] = out_dec["x_hat"].mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
+          out_dec["x_hat"] = crop(out_dec["x_hat"], padding)
+          num_pixels = x.size(0) * x.size(2) * x.size(3)
+          # print(f'Bitrate: {(sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels):.3f}bpp')
+          # print(f'MS-SSIM: {compute_msssim(x, out_dec["x_hat"]):.2f}dB')
+          # print(f'PSNR: {compute_psnr(x, out_dec["x_hat"]):.2f}dB')
+          compressed_total_bytes = compute_total_bytes(out_enc)
+          Bit_rate += compressed_total_bytes * 8.0 / num_pixels
+          compression_ratio += num_pixels * 3 / compressed_total_bytes
+          PSNR += compute_psnr(x, out_dec["x_hat"])
+          MS_SSIM += compute_msssim(x, out_dec["x_hat"])
+          # '''
+          # Visualization
+          # '''
+          # image_name = os.path.basename(img_path)
+          # if image_name in ["kodim04.png", "kodim12.png"]:
+          #   error = torch.abs(x - out_dec["x_hat"])
+          #   hat_img = transforms.ToPILImage()(out_dec["x_hat"].squeeze(0).cpu())
+          #   error_img = transforms.ToPILImage()((error*10).clamp(0,1).squeeze(0).cpu())
+          #   Image.open(img_path).convert('RGB').save(f"./results/{image_name}")
+          #   hat_img.save(f"./results/hat_{image_name}")
+          #   error_img.save(f"./results/error_{image_name}")
+        if is_epoch_finished:
+          break
 
-  else:
-    while True:
-      batch_data_array, normalize_min_array, normalize_max_array, is_full_batch, is_epoch_finished = valid_dataloader.sample_batch()
-      x = torch.Tensor(batch_data_array).float().to(device)
-      x = x.unsqueeze(1).repeat(1, 3, 1, 1)
-      x_padded, padding = pad(x, p)
-      count += 1
-      with torch.no_grad():
-        if args.cuda:
-          torch.cuda.synchronize(device)
-        s = time.time()
-        out_net = net.forward(x_padded)
-        if args.cuda:
-          torch.cuda.synchronize(device)
-        e = time.time()
-        total_time += (e - s)
-        out_net['x_hat'].clamp_(0, 1)
-        out_net["x_hat"] = out_net["x_hat"].mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
-        out_net["x_hat"] = crop(out_net["x_hat"], padding)
-        # print(f'PSNR: {compute_psnr(x, out_net["x_hat"]):.2f}dB')
-        # print(f'MS-SSIM: {compute_msssim(x, out_net["x_hat"]):.2f}dB')
-        # print(f'Bit-rate: {compute_bpp(out_net):.3f}bpp')
-        PSNR += compute_psnr(x, out_net["x_hat"])
-        MS_SSIM += compute_msssim(x, out_net["x_hat"])
-        Bit_rate += compute_bpp(out_net)
-      if is_epoch_finished:
-        break
-  PSNR = PSNR / count
-  MS_SSIM = MS_SSIM / count
-  Bit_rate = Bit_rate / count
-  total_time = total_time / count
-  # print(f'Avg PSNR: {PSNR:.2f}dB')
-  # print(f'Avg MS-SSIM: {MS_SSIM:.4f}')
-  # print(f'Avg Bit-rate: {Bit_rate:.3f} bpp')
-  # print(f'Avg compress-decompress time: {total_time:.3f} ms')
-  result = {
-    "worker_idx": worker_idx,
-    "psnr": PSNR,
-    "ms_ssim": MS_SSIM,
-    "bit_rate": Bit_rate,
-    "total_time": total_time,
-  }
-  if args.real:
-    compression_ratio = compression_ratio / count
-    result["compression_ratio"] = compression_ratio
-    # print(f'Avg compression ratio: {compression_ratio:.2f}')
+    else:
+      while True:
+        batch_data_array, normalize_min_array, normalize_max_array, is_full_batch, is_epoch_finished = valid_dataloader.sample_batch()
+        x = torch.Tensor(batch_data_array).float().to(device)
+        x = x.unsqueeze(1).repeat(1, 3, 1, 1)
+        x_padded, padding = pad(x, p)
+        count += 1
+        with torch.no_grad():
+          if args.cuda:
+            torch.cuda.synchronize(device)
+          s = time.time()
+          out_net = net.forward(x_padded)
+          if args.cuda:
+            torch.cuda.synchronize(device)
+          e = time.time()
+          total_time += (e - s)
+          out_net['x_hat'].clamp_(0, 1)
+          out_net["x_hat"] = out_net["x_hat"].mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
+          out_net["x_hat"] = crop(out_net["x_hat"], padding)
+          # print(f'PSNR: {compute_psnr(x, out_net["x_hat"]):.2f}dB')
+          # print(f'MS-SSIM: {compute_msssim(x, out_net["x_hat"]):.2f}dB')
+          # print(f'Bit-rate: {compute_bpp(out_net):.3f}bpp')
+          PSNR += compute_psnr(x, out_net["x_hat"])
+          MS_SSIM += compute_msssim(x, out_net["x_hat"])
+          Bit_rate += compute_bpp(out_net)
+        if is_epoch_finished:
+          break
+    PSNR = PSNR / count
+    MS_SSIM = MS_SSIM / count
+    Bit_rate = Bit_rate / count
+    total_time = total_time / count
+    # print(f'Avg PSNR: {PSNR:.2f}dB')
+    # print(f'Avg MS-SSIM: {MS_SSIM:.4f}')
+    # print(f'Avg Bit-rate: {Bit_rate:.3f} bpp')
+    # print(f'Avg compress-decompress time: {total_time:.3f} ms')
+    result = {
+      "worker_idx": worker_idx,
+      "psnr": PSNR,
+      "ms_ssim": MS_SSIM,
+      "bit_rate": Bit_rate,
+      "total_time": total_time,
+    }
+    if args.real:
+      compression_ratio = compression_ratio / count
+      result["compression_ratio"] = compression_ratio
+      # print(f'Avg compression ratio: {compression_ratio:.2f}')
+  except:
+    result = {
+      "worker_idx": worker_idx,
+      "psnr": float('nan'),
+      "ms_ssim": float('nan'),
+      "bit_rate": float('nan'),
+      "total_time": float('nan'),
+    }
+    if args.real:
+      result["compression_ratio"] = float('nan')
   return result
   
 def main():
@@ -344,7 +355,7 @@ def main():
   n_lst = ["64", "128"]
   lambda_lst = ["0.0025", "0.0035", "0.0067", "0.013", "0.025", "0.05"]
   # lambda_lst = ["0.05"]
-  label_lst = [str(5*i) for i in range(11)] + ["best", "latest"]
+  label_lst = [str(i) for i in range(51)] + ["best", "latest"]
 
   '''
   run eval

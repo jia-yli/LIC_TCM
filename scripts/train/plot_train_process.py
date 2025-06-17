@@ -4,11 +4,11 @@ import matplotlib.pyplot as plt
 import itertools
 
 
-def draw_plot(metric_name, metric_unit):
+def draw_plot(metric_name, metric_unit, train_label):
   '''
   Preparation
   '''
-  df = pd.read_csv('/users/ljiayong/projects/LIC_TCM/results/eval_tcm_ckpt_era5_1.csv')
+  df = pd.read_csv(f'/users/ljiayong/projects/LIC_TCM/results/eval_tcm_ckpt_era5_{train_label}.csv')
 
   variable_lst = ['10m_u_component_of_wind']
 
@@ -37,16 +37,20 @@ def draw_plot(metric_name, metric_unit):
     plt.ylabel(f'{metric_name}{metric_unit}')
     plt.legend()
     plt.grid(True)
-    output_path = f"./results/train_{variable}_{metric_name}_vs_epoch.png"
+    output_path = f"./results/train_process/train_{train_label}_{variable}_{metric_name}_vs_epoch.png"
     plt.savefig(output_path, dpi=500, bbox_inches="tight")
     plt.close()
 
 if __name__ == "__main__":
-  metric_names = ["bit_rate", "compression_ratio", "psnr", "ms_ssim"]
-  metric_units = ["[bpp]", "", "[dB]", "[dB]"]
+  # train_label_lst = ["20epoch", "50epoch", "finetune", "full_res"]
+  train_label_lst = ["full_res_1"]
 
-  for param in zip(metric_names, metric_units):
-    draw_plot(*param)
+  for train_label in train_label_lst:
+    metric_names = ["bit_rate", "compression_ratio", "psnr", "ms_ssim"]
+    metric_units = ["[bpp]", "", "[dB]", "[dB]"]
+
+    for param in zip(metric_names, metric_units):
+      draw_plot(*param, train_label=train_label)
 
 
 

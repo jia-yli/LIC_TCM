@@ -10,8 +10,15 @@ for i in "${!lambdas[@]}"; do
 
   CUDA_VISIBLE_DEVICES=$gpu_id python -u ${SCRIPT_DIR}/../../train_era5.py -d /capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/datasets/imagenet_256_50000 \
     --patch-size -1 --batch-size 2 \
-    --cuda --N 128 --lambda $lambda --epochs 20 --lr_epoch 15 18 \
+    --continue-train \
+    --cuda --N 64 --lambda $lambda --epochs 4 --lr_epoch 5 \
     --save_path /capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/checkpoints --save &
+
+  # CUDA_VISIBLE_DEVICES=$gpu_id python -u ${SCRIPT_DIR}/../../train_era5.py -d /capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/datasets/imagenet_256_50000 \
+  #   --patch-size -1 --batch-size 2 \
+  #   --checkpoint /capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/pretrained/lic_tcm_n_64_lambda_${lambda}.pth.tar \
+  #   --cuda --N 64 --lambda ${lambda} --epochs 4 --lr_epoch 5 \
+  #   --save_path /capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/checkpoints --save &
 
 done
 
