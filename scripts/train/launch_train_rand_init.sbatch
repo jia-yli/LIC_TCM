@@ -38,5 +38,5 @@ ENV_VARS="
 srun --environment=/users/ljiayong/projects/LIC_TCM/docker/alps/clariden.toml bash -c "
   ${ENV_VARS}
   # pip install -e .
-  ./scripts/train/run_train.sh
+  ./scripts/train/run_train_dp_rand_init.sh
 "

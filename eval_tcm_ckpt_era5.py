@@ -19,6 +19,7 @@ import xarray as xr
 import numpy as np
 from torch.utils.data import Dataset
 import itertools
+import matplotlib.pyplot as plt
 warnings.filterwarnings("ignore")
 
 def compute_psnr(a, b):
@@ -270,14 +271,35 @@ def eval_tcm_era5(configs):
           # '''
           # Visualization
           # '''
-          # image_name = os.path.basename(img_path)
-          # if image_name in ["kodim04.png", "kodim12.png"]:
-          #   error = torch.abs(x - out_dec["x_hat"])
-          #   hat_img = transforms.ToPILImage()(out_dec["x_hat"].squeeze(0).cpu())
-          #   error_img = transforms.ToPILImage()((error*10).clamp(0,1).squeeze(0).cpu())
-          #   Image.open(img_path).convert('RGB').save(f"./results/{image_name}")
-          #   hat_img.save(f"./results/hat_{image_name}")
-          #   error_img.save(f"./results/error_{image_name}")
+          # # import pdb;pdb.set_trace()
+          # # save_path = '/users/ljiayong/projects/LIC_TCM/results/era5_full_res_finetune'
+          # save_path = '/users/ljiayong/projects/LIC_TCM/results/pretrained'
+          # error = torch.abs(x - out_dec["x_hat"])
+          # img = transforms.ToPILImage()(x.squeeze(0).cpu())
+          # hat_img = transforms.ToPILImage()(out_dec["x_hat"].squeeze(0).cpu())
+          # error_img = transforms.ToPILImage()(error.clamp(0,1).squeeze(0).cpu())
+          # error_x10_img = transforms.ToPILImage()((error*10).clamp(0,1).squeeze(0).cpu())
+          
+          # img.save(os.path.join(save_path, 'img.png'))
+          # hat_img.save(os.path.join(save_path, 'hat.png'))
+          # error_img.save(os.path.join(save_path, 'err.png'))
+          # error_x10_img.save(os.path.join(save_path, 'err_x10.png'))
+
+
+          # plt.figure(figsize=(10, 8))
+          # error_values = (out_dec["x_hat"] - x).cpu().numpy().flatten()
+          # plt.hist(error_values, bins=60, edgecolor='black')
+          # plt.axvline(error_values.min(), color='red', linestyle='--', linewidth=1, label=f"Min: {error_values.min():.4f}")
+          # plt.axvline(error_values.max(), color='red', linestyle='--', linewidth=1, label=f"Max: {error_values.max():.4f}")
+          # # Labels and title
+          # plt.xlabel('Normalized Error')
+          # plt.ylabel('Count')
+          # plt.legend()
+          # plt.grid(True)
+
+          # plt.savefig(os.path.join(save_path, 'err_dist.png'), dpi=500, bbox_inches="tight")
+          # break
+            
         if is_epoch_finished:
           break
 
@@ -354,14 +376,17 @@ def main():
 
   n_lst = ["64", "128"]
   lambda_lst = ["0.0025", "0.0035", "0.0067", "0.013", "0.025", "0.05"]
-  # lambda_lst = ["0.05"]
-  label_lst = [str(i) for i in range(51)] + ["best", "latest"]
+  label_lst = [str(i) for i in range(-1, 51)] + ["best", "latest"]
+
+  n_lst = ["64"]
+  lambda_lst = ["0.05"]
+  label_lst = ["best"]
 
   '''
   run eval
   '''
   num_gpus = torch.cuda.device_count()
-  # num_gpus = 1
+  num_gpus = 1
   ctx = mp.get_context('spawn')
   pool = ctx.Pool(processes=num_gpus)
   results = []
@@ -374,7 +399,8 @@ def main():
             ckpt_name = f"{label}_checkpoint.pth.tar"
           except:
             ckpt_name = f"checkpoint_{label}.pth.tar"
-          checkpoint = f"/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/checkpoints/N_{n}_lambda_{_lambda}/{ckpt_name}"
+          # checkpoint = f"/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/checkpoints_era5_full_res_finetune/N_{n}_lambda_{_lambda}/{ckpt_name}"
+          checkpoint = f"/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/pretrained/lic_tcm_n_64_lambda_0.05.pth.tar"
           if os.path.exists(checkpoint):
             checkpoint_content = torch.load(checkpoint, map_location='cpu')
             epoch = checkpoint_content["epoch"] + 1
@@ -434,7 +460,7 @@ def main():
     
     results[idx] = result
     df = pd.DataFrame(results[:idx+1])
-    df.to_csv("./results/eval_tcm_ckpt_era5.csv", index=False)
+    # df.to_csv("./results/eval_tcm_ckpt_era5_dp_test.csv", index=False)
   
   pool.join()
 

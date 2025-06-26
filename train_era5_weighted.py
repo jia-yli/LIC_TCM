@@ -45,18 +45,6 @@ class Era5ReanalysisDataset:
       raise ValueError(f"Unsupported dataset split: {split}")
     self.month_lst = ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"]
 
-    # other params
-    # self.n_samples = 0
-    # self.n_files = 0
-    # for year in self.year_lst:
-    #   for month in self.month_lst:
-    #     reanalysis_file = os.path.join(self.era5_root, f"single_level/reanalysis/{year}/{month}/{variable}.nc")
-    #     reanalysis_dataset = xr.open_dataset(reanalysis_file)
-    #     assert len(reanalysis_dataset.data_vars) == 1
-    #     data_array = reanalysis_dataset[list(reanalysis_dataset.data_vars)[0]].values
-    #     self.n_sample += data_array.shape[0]
-    #     self.n_files += 1
-
     # states
     self._start_new_epoch() # reset states
     self._load_next_file() # load data
@@ -83,15 +71,22 @@ class Era5ReanalysisDataset:
     self.current_file = self.remaining_files.pop()
     year, month = self.current_file
     reanalysis_file = os.path.join(self.era5_root, f"single_level/reanalysis/{year}/{month}/{self.variable}.nc")
+    interpolated_ensemble_spread_file = os.path.join(self.era5_root, f"single_level/interpolated_ensemble_spread/{year}/{month}/{self.variable}.nc")
     reanalysis_dataset = xr.open_dataset(reanalysis_file)
+    interpolated_ensemble_spread_dataset = xr.open_dataset(interpolated_ensemble_spread_file)
     assert len(reanalysis_dataset.data_vars) == 1
+    assert len(interpolated_ensemble_spread_dataset.data_vars) == 1
+    assert list(reanalysis_dataset.data_vars)[0] == list(interpolated_ensemble_spread_dataset.data_vars)[0]
     self.current_data = reanalysis_dataset[list(reanalysis_dataset.data_vars)[0]].values
+    self.current_interpolated_ensemble_spread = interpolated_ensemble_spread_dataset[list(interpolated_ensemble_spread_dataset.data_vars)[0]].values
     self.n_samples = self.current_data.shape[0]
+    assert self.current_data.shape == self.current_interpolated_ensemble_spread.shape
     # normalize
     self.current_normalize_min = np.min(self.current_data, axis=(-1, -2), keepdims=True)
     self.current_normalize_max = np.max(self.current_data, axis=(-1, -2), keepdims=True)
     assert (self.current_normalize_min != self.current_normalize_max).all()
     self.current_data = (self.current_data - self.current_normalize_min) / (self.current_normalize_max - self.current_normalize_min)
+    self.current_interpolated_ensemble_spread = self.current_interpolated_ensemble_spread / (self.current_normalize_max - self.current_normalize_min)
 
     if self.split == 'train':
       self.access_indices = np.random.permutation(self.n_samples)
@@ -122,8 +117,10 @@ class Era5ReanalysisDataset:
       w_idx = w_start_idx[:, np.newaxis] + np.arange(self.patch_size)[np.newaxis, :]
 
       selected_data = self.current_data[selected_idx[:, np.newaxis, np.newaxis], h_idx[:, :, np.newaxis], w_idx[:, np.newaxis, :]]
+      selected_interpolated_ensemble_spread = self.current_interpolated_ensemble_spread[selected_idx[:, np.newaxis, np.newaxis], h_idx[:, :, np.newaxis], w_idx[:, np.newaxis, :]]
     else:
       selected_data = self.current_data[selected_idx]
+      selected_interpolated_ensemble_spread = self.current_interpolated_ensemble_spread[selected_idx]
 
     selected_data_min = self.current_normalize_min[selected_idx]
     selected_data_max = self.current_normalize_max[selected_idx]
@@ -133,19 +130,25 @@ class Era5ReanalysisDataset:
     else:
       is_file_finished = False
 
-    return selected_data, selected_data_min, selected_data_max, is_file_finished
+    rms = np.sqrt((selected_interpolated_ensemble_spread**2).mean())
+    selected_weight = np.clip(selected_interpolated_ensemble_spread / rms, 0.1, 10)
+    return selected_data, selected_weight, selected_interpolated_ensemble_spread, selected_data_min, selected_data_max, is_file_finished
 
   def sample_batch(self):
     batch_data = []
+    batch_weight = []
+    batch_interpolated_ensemble_spread = []
     normalize_min = []
     normalize_max = []
     current_batch_size = 0
     is_epoch_finished = False
     while current_batch_size < self.batch_size:
-      selected_data, selected_data_min, selected_data_max, is_file_finished = self._sample_batch(self.batch_size)
+      selected_data, selected_weight, selected_interpolated_ensemble_spread, selected_data_min, selected_data_max, is_file_finished = self._sample_batch(self.batch_size)
       batch_size = len(selected_data)
 
       batch_data.append(selected_data)
+      batch_weight.append(selected_weight)
+      batch_interpolated_ensemble_spread.append(selected_interpolated_ensemble_spread)
       normalize_min.append(selected_data_min)
       normalize_max.append(selected_data_max)
       current_batch_size += batch_size
@@ -157,10 +160,12 @@ class Era5ReanalysisDataset:
           break
 
     batch_data_array = np.concatenate(batch_data, axis=0)  # shape [b, h, w]
+    batch_weight_array = np.concatenate(batch_weight, axis=0)  # shape [b, h, w]
+    batch_interpolated_ensemble_spread_array = np.concatenate(batch_interpolated_ensemble_spread, axis=0)  # shape [b, h, w]
     normalize_min_array = np.concatenate(normalize_min, axis=0)  # shape [b, h, w]
     normalize_max_array = np.concatenate(normalize_max, axis=0)  # shape [b, h, w]
     is_full_batch = current_batch_size == self.batch_size
-    return batch_data_array, normalize_min_array, normalize_max_array, is_full_batch, is_epoch_finished
+    return batch_data_array, batch_weight_array, batch_interpolated_ensemble_spread_array, normalize_min_array, normalize_max_array, is_full_batch, is_epoch_finished
 
 def compute_msssim(a, b):
   return ms_ssim(a, b, data_range=1.)
@@ -168,13 +173,12 @@ def compute_msssim(a, b):
 class RateDistortionLoss(nn.Module):
   """Custom rate distortion loss with a Lagrangian parameter."""
 
-  def __init__(self, lmbda=1e-2, type='mse'):
+  def __init__(self, lmbda=1e-2):
     super().__init__()
-    self.mse = nn.MSELoss()
     self.lmbda = lmbda
-    self.type = type
 
-  def forward(self, output, target):
+  def forward(self, output, target, weight):
+    assert (output["x_hat"].shape == target.shape == weight.shape)
     N, _, H, W = target.size()
     out = {}
     num_pixels = N * H * W
@@ -183,12 +187,9 @@ class RateDistortionLoss(nn.Module):
       (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
       for likelihoods in output["likelihoods"].values()
     )
-    if self.type == 'mse':
-      out["mse_loss"] = self.mse(output["x_hat"], target)
-      out["loss"] = self.lmbda * 255 ** 2 * out["mse_loss"] + out["bpp_loss"]
-    else:
-      out['ms_ssim_loss'] = compute_msssim(output["x_hat"], target)
-      out["loss"] = self.lmbda * (1 - out['ms_ssim_loss']) + out["bpp_loss"]
+
+    out["mse_loss"] = ((output["x_hat"] - target).pow(2) / (weight.pow(2))).mean()
+    out["loss"] = self.lmbda * 255 ** 2 * out["mse_loss"] + out["bpp_loss"]
 
     return out
 
@@ -252,7 +253,7 @@ def configure_optimizers(net, args):
   )
   return optimizer, aux_optimizer
 
-def pad(x, p):
+def pad(x, p, v=0):
   h, w = x.size(2), x.size(3)
   new_h = (h + p - 1) // p * p
   new_w = (w + p - 1) // p * p
@@ -264,7 +265,7 @@ def pad(x, p):
     x,
     (padding_left, padding_right, padding_top, padding_bottom),
     mode="constant",
-    value=0,
+    value=v,
   )
   return x_padded, (padding_left, padding_right, padding_top, padding_bottom)
 
@@ -283,21 +284,28 @@ def train_one_epoch(
   # for i, d in enumerate(train_dataloader):
   i = 0
   while True:
-    batch_data_array, normalize_min_array, normalize_max_array, is_full_batch, is_epoch_finished = train_dataloader.sample_batch()
+    batch_data_array, batch_weight_array, batch_interpolated_ensemble_spread_array, normalize_min_array, normalize_max_array, is_full_batch, is_epoch_finished = train_dataloader.sample_batch()
     if not is_full_batch:
       assert is_epoch_finished
       break
     d = torch.Tensor(batch_data_array).float().to(device)
     d = d.unsqueeze(1).repeat(1, 3, 1, 1)
+
+    b = torch.Tensor(batch_weight_array).float().to(device)
+    b = b.unsqueeze(1).repeat(1, 3, 1, 1)
+
     optimizer.zero_grad()
     aux_optimizer.zero_grad()
 
-    d_padded, padding = pad(d, 128)
+    d_padded, padding = pad(d, 128, 0)
+    b_padded, padding = pad(b, 128, 1)
+
     out_net = model(d_padded)
+
     out_net["x_hat"] = out_net["x_hat"].mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
     out_net["x_hat"] = crop(out_net["x_hat"], padding)
 
-    out_criterion = criterion(out_net, d)
+    out_criterion = criterion(out_net, d, b)
     out_criterion["loss"].backward()
     if clip_max_norm > 0:
       torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm)
@@ -341,14 +349,21 @@ def valid_epoch(epoch, valid_dataloader, model, criterion, type='mse'):
 
     with torch.no_grad():
       while True:
-        batch_data_array, normalize_min_array, normalize_max_array, is_full_batch, is_epoch_finished = valid_dataloader.sample_batch()
+        batch_data_array, batch_weight_array, batch_interpolated_ensemble_spread_array, normalize_min_array, normalize_max_array, is_full_batch, is_epoch_finished = valid_dataloader.sample_batch()
         d = torch.Tensor(batch_data_array).float().to(device)
         d = d.unsqueeze(1).repeat(1, 3, 1, 1)
-        d_padded, padding = pad(d, 128)
+
+        b = torch.Tensor(batch_weight_array).float().to(device)
+        b = b.unsqueeze(1).repeat(1, 3, 1, 1)
+
+        d_padded, padding = pad(d, 128, 0)
+        b_padded, padding = pad(b, 128, 1)
+
         out_net = model(d_padded)
+
         out_net["x_hat"] = out_net["x_hat"].mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
         out_net["x_hat"] = crop(out_net["x_hat"], padding)
-        out_criterion = criterion(out_net, d)
+        out_criterion = criterion(out_net, d, b)
 
         aux_loss.update(model.aux_loss())
         bpp_loss.update(out_criterion["bpp_loss"])
@@ -373,7 +388,7 @@ def valid_epoch(epoch, valid_dataloader, model, criterion, type='mse'):
 
     with torch.no_grad():
       while True:
-        batch_data_array, normalize_min_array, normalize_max_array, is_full_batch, is_epoch_finished = valid_dataloader.sample_batch()
+        batch_data_array, batch_weight_array, batch_interpolated_ensemble_spread_array, normalize_min_array, normalize_max_array, is_full_batch, is_epoch_finished = valid_dataloader.sample_batch()
         d = torch.Tensor(batch_data_array).float().to(device)
         d = d.unsqueeze(1).repeat(1, 3, 1, 1)
         d_padded, padding = pad(d, 128)
@@ -536,7 +551,7 @@ def main(argv):
   print("milestones: ", milestones)
   lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma=0.1, last_epoch=-1)
 
-  criterion = RateDistortionLoss(lmbda=args.lmbda, type=type)
+  criterion = RateDistortionLoss(lmbda=args.lmbda)
 
   last_epoch = 0
   default_checkpoint_path = os.path.join(save_path, "checkpoint_latest.pth.tar")
