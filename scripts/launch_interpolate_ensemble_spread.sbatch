@@ -7,9 +7,9 @@
 #SBATCH --nodes=1                         # Number of nodes
 #SBATCH --ntasks=1                        # Number of tasks (1 for single task)
 #SBATCH --cpus-per-task=128               # Number of CPU cores per task
-#SBATCH --mem=256G                        # Memory allocation
+#SBATCH --mem=384G                        # Memory allocation
 #SBATCH --gpus=4                          # Number of GPUs
-#SBATCH --time=6:00:00                    # Time limit
+#SBATCH --time=12:00:00                    # Time limit
 
 # Print detailed job metadata
 JOB_TIME_LIMIT=$(squeue -j $SLURM_JOB_ID -h --Format TimeLimit)
@@ -37,5 +37,6 @@ ENV_VARS="
 
 srun --environment=/users/ljiayong/projects/LIC_TCM/docker/alps/clariden.toml bash -c "
   ${ENV_VARS}
-  python ./scripts/interpolate_ensemble_spread.py 
+  # python ./scripts/interpolate_ensemble_spread.py 
+  ./scripts/run_interpolate_ensemble_spread.sh
 "

@@ -216,7 +216,7 @@ def eval_tcm_era5(configs):
   try:
     # datasets
     variable = args.variable
-    valid_dataset = Era5ReanalysisDataset(variable=variable, batch_size=1, split='valid')
+    valid_dataset = Era5ReanalysisDataset(variable=variable, batch_size=1, split='test')
     valid_dataloader = valid_dataset
 
     if args.cuda:
@@ -278,7 +278,7 @@ def eval_tcm_era5(configs):
           # img = transforms.ToPILImage()(x.squeeze(0).cpu())
           # hat_img = transforms.ToPILImage()(out_dec["x_hat"].squeeze(0).cpu())
           # error_img = transforms.ToPILImage()(error.clamp(0,1).squeeze(0).cpu())
-          # error_x10_img = transforms.ToPILImage()((error*10).clamp(0,1).squeeze(0).cpu())
+          # error_x10_img = transforms.ToPILImage()((error*20).clamp(0,1).squeeze(0).cpu())
           
           # img.save(os.path.join(save_path, 'img.png'))
           # hat_img.save(os.path.join(save_path, 'hat.png'))
@@ -378,15 +378,15 @@ def main():
   lambda_lst = ["0.0025", "0.0035", "0.0067", "0.013", "0.025", "0.05"]
   label_lst = [str(i) for i in range(-1, 51)] + ["best", "latest"]
 
-  n_lst = ["64"]
-  lambda_lst = ["0.05"]
-  label_lst = ["best"]
+  # n_lst = ["64"]
+  # lambda_lst = ["0.05"]
+  # label_lst = ["best"]
 
   '''
   run eval
   '''
   num_gpus = torch.cuda.device_count()
-  num_gpus = 1
+  # num_gpus = 1
   ctx = mp.get_context('spawn')
   pool = ctx.Pool(processes=num_gpus)
   results = []
@@ -399,8 +399,9 @@ def main():
             ckpt_name = f"{label}_checkpoint.pth.tar"
           except:
             ckpt_name = f"checkpoint_{label}.pth.tar"
+          checkpoint = f"/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/checkpoints_weighted_fintune/N_{n}_lambda_{_lambda}/{ckpt_name}"
           # checkpoint = f"/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/checkpoints_era5_full_res_finetune/N_{n}_lambda_{_lambda}/{ckpt_name}"
-          checkpoint = f"/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/pretrained/lic_tcm_n_64_lambda_0.05.pth.tar"
+          # checkpoint = f"/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/pretrained/lic_tcm_n_64_lambda_0.05.pth.tar"
           if os.path.exists(checkpoint):
             checkpoint_content = torch.load(checkpoint, map_location='cpu')
             epoch = checkpoint_content["epoch"] + 1
@@ -460,7 +461,7 @@ def main():
     
     results[idx] = result
     df = pd.DataFrame(results[:idx+1])
-    # df.to_csv("./results/eval_tcm_ckpt_era5_dp_test.csv", index=False)
+    df.to_csv("./results/eval_tcm_ckpt_weighted_finetune.csv", index=False)
   
   pool.join()
 

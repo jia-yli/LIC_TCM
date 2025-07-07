@@ -1,7 +1,10 @@
 import os
+import argparse
+
 import xarray as xr
 import numpy as np
 import multiprocessing as mp
+
 from scipy.interpolate import griddata
 from tqdm import tqdm
 
@@ -47,7 +50,7 @@ def interpolate_ensemble_to_reanalysis(reanalysis_file, ensemble_file, output_fi
     num_jobs = (data_extended.shape[0] + num_time_steps - 1) // num_time_steps
 
     # mp
-    with mp.Pool(processes=32) as pool:  # Adjust processes as needed
+    with mp.Pool(processes=16) as pool:  # Adjust processes as needed
       results = [pool.apply_async(spatial_interpolation,
         (data_extended, lat_source_grid, lon_source_grid, lat_target_grid, lon_target_grid, idx*num_time_steps, min((idx+1)*num_time_steps, data_extended.shape[0]))
       ) for idx in range(num_jobs)]
@@ -83,13 +86,39 @@ def interpolate_ensemble_to_reanalysis(reanalysis_file, ensemble_file, output_fi
     return True
 
 
-if __name__ == '__main__':
-  variable_lst = [
-    "10m_u_component_of_wind",
-    # "10m_v_component_of_wind",
-    # "2m_temperature",
-    # "total_precipitation"
-  ]
+def main():
+  # argparse
+  parser = argparse.ArgumentParser()
+  parser.add_argument(
+    "--variable-lst", 
+    nargs="+",
+    type=str,
+    required=True,
+    help="List of variables"
+  )
+  args = parser.parse_args()
+
+  variable_lst = args.variable_lst
+  # variable_lst = [
+  #   "100m_u_component_of_wind",
+  #   "100m_v_component_of_wind",
+  #   "10m_u_component_of_wind",
+  #   "10m_v_component_of_wind",
+  #   "2m_dewpoint_temperature",
+  #   "2m_temperature",
+  #   "ice_temperature_layer_1",
+  #   "ice_temperature_layer_2",
+  #   "ice_temperature_layer_3",
+  #   "ice_temperature_layer_4",
+  #   "maximum_2m_temperature_since_previous_post_processing",
+  #   "mean_sea_level_pressure",
+  #   "minimum_2m_temperature_since_previous_post_processing",
+  #   "sea_surface_temperature",
+  #   "skin_temperature",
+  #   "surface_pressure",
+  #   "total_precipitation",
+  # ]
+
   era5_root = "/capstor/scratch/cscs/ljiayong/datasets/ERA5_large"
   year_lst = [str(y) for y in range(2015, 2025)]
   month_lst = ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"]
@@ -127,3 +156,6 @@ if __name__ == '__main__':
   #         )
   #   for res in tqdm(results):
   #     res.get()
+
+if __name__ == "__main__":
+  main()

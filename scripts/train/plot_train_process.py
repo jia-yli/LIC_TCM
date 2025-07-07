@@ -42,8 +42,8 @@ def draw_plot(metric_name, metric_unit, train_label):
     plt.close()
 
 if __name__ == "__main__":
-  # train_label_lst = ["20epoch", "50epoch", "finetune", "full_res"]
-  train_label_lst = ["full_res_1"]
+  # train_label_lst = ["20epoch", "50epoch", "finetune", "full_res", "full_res_1"]
+  train_label_lst = ["weighted_finetune", "weighted_rand_init"]
 
   for train_label in train_label_lst:
     metric_names = ["bit_rate", "compression_ratio", "psnr", "ms_ssim"]

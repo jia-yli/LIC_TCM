@@ -433,7 +433,7 @@ def parse_args(argv):
     help="Model architecture (default: %(default)s)",
   )
   parser.add_argument(
-    "-d", "--dataset", type=str, required=True, help="Training dataset"
+    "--variable", type=str, required=True, help="ERA5 Variable"
   )
   parser.add_argument(
     "-e",
@@ -560,7 +560,11 @@ def main(argv):
     if checkpoint_path is None:
       checkpoint_path = default_checkpoint_path
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    net.load_state_dict(checkpoint["state_dict"])
+    # handle DP
+    dictory = {}
+    for k, v in checkpoint["state_dict"].items():
+      dictory[k.replace("module.", "")] = v
+    net.load_state_dict(dictory)
     if args.continue_train:
       last_epoch = checkpoint["epoch"] + 1
       optimizer.load_state_dict(checkpoint["optimizer"])
