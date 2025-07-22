@@ -6,7 +6,6 @@ import numpy as np
 import pandas as pd
 import multiprocessing as mp
 import itertools
-from scipy.interpolate import griddata
 from tqdm import tqdm
 
 import pickle
@@ -15,101 +14,6 @@ import re
 import torch
 import torch.nn.functional as F
 from models import TCM
-
-def convert_nc_to_hdf5(nc_file, hdf5_file):
-  """
-  Convert a NetCDF (.nc) file to HDF5 (.h5) format.
-
-  Parameters:
-    nc_file (str): Path to the input NetCDF file.
-    hdf5_file (str): Path to the output HDF5 file.
-  """
-  # Open the NetCDF file
-  dataset = xr.open_dataset(nc_file)
-
-  # Create an HDF5 file
-  with h5py.File(hdf5_file, 'w') as hdf5_f:
-    for var_name, da in dataset.data_vars.items():
-      data = da.values[0:] # Convert xarray DataArray to NumPy array
-      hdf5_f.create_dataset(var_name, data=data)
-
-def spatial_interpolation(data, lat_source_grid, lon_source_grid, lat_target_grid, lon_target_grid, start_idx=0, end_idx=None):
-  data = data[start_idx:end_idx]
-  num_time_steps = data.shape[0]
-  data_interpolated = np.empty((num_time_steps, lon_target_grid.shape[0], lon_target_grid.shape[1]))
-  points = np.column_stack((lat_source_grid.ravel(), lon_source_grid.ravel()))
-  for t_idx in range(num_time_steps):
-    values = data[t_idx].ravel()
-    data_interpolated[t_idx] = griddata(points, values, (lat_target_grid, lon_target_grid), method='linear')
-  return data_interpolated
-
-def interpolate_ensemble_to_reanalysis(reanalysis_file, ensemble_file, output_file):
-  # Load reanalysis and ensemble datasets
-  ds_reanalysis = xr.open_dataset(reanalysis_file)
-  ds_ensemble = xr.open_dataset(ensemble_file)
-
-  # Extract coordinates from reanalysis dataset (target grid)
-  time_target = ds_reanalysis['valid_time'].values
-  lat_target = ds_reanalysis['latitude'].values
-  lon_target = ds_reanalysis['longitude'].values
-
-  # Extract coordinates and spread variable from ensemble dataset (source grid)
-  time_source = ds_ensemble['valid_time'].values
-  lat_source = ds_ensemble['latitude'].values
-  lon_source = ds_ensemble['longitude'].values
-
-  # shape: (Time, Latitude, Longitude)
-  assert len(list(ds_ensemble.data_vars)) == 1
-  for var_name, da in ds_ensemble.data_vars.items():
-    data_source = da.values  # Convert xarray DataArray to NumPy array
-    # Step 1: Interpolate Spatial Dims
-    # handle longitude wrap-up at 360
-    # Src
-    lon_source_extended = np.concatenate((lon_source, lon_source[0:1] + 360), axis=0)
-    lat_source_grid, lon_source_grid = np.meshgrid(lat_source, lon_source_extended, indexing='ij')
-    data_extended = np.concatenate((data_source, data_source[:, :, 0:1]), axis=2)
-    # Dst
-    lat_target_grid, lon_target_grid = np.meshgrid(lat_target, lon_target, indexing='ij')
-
-    num_time_steps = 8
-    num_jobs = (data_extended.shape[0] + num_time_steps - 1) // num_time_steps
-
-    # mp
-    with mp.Pool(processes=32) as pool:  # Adjust processes as needed
-      results = [pool.apply_async(spatial_interpolation,
-        (data_extended, lat_source_grid, lon_source_grid, lat_target_grid, lon_target_grid, idx*num_time_steps, min((idx+1)*num_time_steps, data_extended.shape[0]))
-      ) for idx in range(num_jobs)]
-      results = [result.get() for result in results]
-    
-    # for loop
-    # results = [spatial_interpolation(
-    #   data_extended, lat_source_grid, lon_source_grid, lat_target_grid, lon_target_grid, idx*num_time_steps, min((idx+1)*num_time_steps, data_extended.shape[0])
-    # ) for idx in range(num_jobs)]
-
-    results = np.concatenate(results, axis=0)
-
-    # Step 2: Interpolate Temporal Dim
-    ds_interp_space = xr.Dataset(
-      {
-        var_name: (['valid_time', 'latitude', 'longitude'], results)
-      },
-      coords={
-        'valid_time': time_source,
-        'latitude': lat_target,
-        'longitude': lon_target
-      }
-    )
-    # Interpolate in time to match reanalysis time grid
-    ds_interp_time = ds_interp_space.interp(
-      valid_time=time_target, 
-      method="linear")
-    ds_output = ds_interp_time.ffill(dim="valid_time")
-
-    # Save to new hdf5 file
-    with h5py.File(output_file, 'w') as hdf5_f:
-      for var_name, da in ds_output.data_vars.items():
-        data = da.values.astype(np.float32)[0:] # Convert xarray DataArray to NumPy array
-        hdf5_f.create_dataset(var_name, data=data)
 
 class LicTcmCompressor:
   def __init__(self, checkpoint_path1, checkpoint_path2):
@@ -263,6 +167,7 @@ class LicTcmCompressor:
 
   def run_benchmark(self, data, error_bound):
     data, error_bound = data[0:5], error_bound[0:5]
+    # import pdb;pdb.set_trace()
 
     print(f'[INFO] Starting Data Compression......')
     results, info = self.compress(data, 1, clip_extreme=True)
@@ -324,19 +229,21 @@ class LicTcmCompressor:
     return best_compressed_bytes, num_residual_runs, num_failed_points, input_size, compression_ratio, failed_bytes_ratio
 
 
-def compress_hdf5_lic_tcm_pointwise(input_hdf5, input_uncertainty_hdf5, output_hdf5, ebcc_pointwise_max_error_ratio, checkpoint_path1, checkpoint_path2):
+def compress_hdf5_lic_tcm_pointwise(reanalysis_file, interpolated_ensemble_spread_file, output_hdf5, ebcc_pointwise_max_error_ratio, checkpoint_path1, checkpoint_path2):
   # compression and compression time
   compression_start_time = time.time()
-  
-  with h5py.File(input_hdf5, 'r') as hdf5_in:
-    with h5py.File(input_uncertainty_hdf5, 'r') as hdf5_uncertainty_in:
-      with h5py.File(output_hdf5, 'w') as hdf5_out:
-        assert len(list(hdf5_in.keys())) == 1
-        var_name = list(hdf5_in.keys())[0]
-        data = np.array(hdf5_in[var_name])  # Read dataset, 1 month data: (744, 721, 1440)
-        error_bound = np.array(hdf5_uncertainty_in[var_name]) * ebcc_pointwise_max_error_ratio
-        compressor = LicTcmCompressor(checkpoint_path1, checkpoint_path2)
-        best_compressed_bytes, num_residual_runs, num_failed_points, input_size, compression_ratio, failed_bytes_ratio = compressor.run_benchmark(data, error_bound)
+
+  reanalysis_dataset = xr.open_dataset(reanalysis_file)
+  interpolated_ensemble_spread_dataset = xr.open_dataset(interpolated_ensemble_spread_file)
+  assert len(reanalysis_dataset.data_vars) == 1
+  assert len(interpolated_ensemble_spread_dataset.data_vars) == 1
+  assert list(reanalysis_dataset.data_vars)[0] == list(interpolated_ensemble_spread_dataset.data_vars)[0]
+  data = reanalysis_dataset[list(reanalysis_dataset.data_vars)[0]].values
+  interpolated_ensemble_spread = interpolated_ensemble_spread_dataset[list(interpolated_ensemble_spread_dataset.data_vars)[0]].values
+  error_bound = interpolated_ensemble_spread * ebcc_pointwise_max_error_ratio
+
+  compressor = LicTcmCompressor(checkpoint_path1, checkpoint_path2)
+  best_compressed_bytes, num_residual_runs, num_failed_points, input_size, compression_ratio, failed_bytes_ratio = compressor.run_benchmark(data, error_bound)
 
   compression_end_time = time.time()
   compression_time = compression_end_time - compression_start_time
@@ -347,13 +254,13 @@ def compress_hdf5_lic_tcm_pointwise(input_hdf5, input_uncertainty_hdf5, output_h
 
   return compression_time, compression_ratio, compression_bandwidth, num_residual_runs, num_failed_points, failed_bytes_ratio
 
-def run_lic_tcm_pointwise(output_path, variable, ebcc_pointwise_max_error_ratio, checkpoint_path1, checkpoint_path2):
+def run_lic_tcm_pointwise(output_path, era5_path, variable, ebcc_pointwise_max_error_ratio, checkpoint_path1, checkpoint_path2):
   if not checkpoint_path2:
     checkpoint_path2 = checkpoint_path1
-  input_hdf5_file_path = os.path.join(output_path, f'{variable}.hdf5')
-  input_uncertainty_file_path = os.path.join(output_path, f'{variable}_interpolated_ensemble_spread.hdf5')
+  reanalysis_file = os.path.join(era5_path, f'single_level/reanalysis/2024/12/{variable}.nc')
+  interpolated_ensemble_spread_file = os.path.join(era5_path, f'single_level/interpolated_ensemble_spread/2024/12/{variable}.nc')
   output_hdf5_file_path = os.path.join(output_path, f'{variable}_compressed_lic_tcm_pointwise_ratio_{ebcc_pointwise_max_error_ratio}.hdf5')
-  compression_time, compression_ratio, compression_bandwidth, num_residual_runs, num_failed_points, failed_bytes_ratio = compress_hdf5_lic_tcm_pointwise(input_hdf5_file_path, input_uncertainty_file_path, output_hdf5_file_path, ebcc_pointwise_max_error_ratio, checkpoint_path1, checkpoint_path2)
+  compression_time, compression_ratio, compression_bandwidth, num_residual_runs, num_failed_points, failed_bytes_ratio = compress_hdf5_lic_tcm_pointwise(reanalysis_file, interpolated_ensemble_spread_file, output_hdf5_file_path, ebcc_pointwise_max_error_ratio, checkpoint_path1, checkpoint_path2)
   results = {
     'checkpoint_path1': checkpoint_path1,
     'checkpoint_path2': checkpoint_path2, 
@@ -369,65 +276,48 @@ def run_lic_tcm_pointwise(output_path, variable, ebcc_pointwise_max_error_ratio,
 
 if __name__ == '__main__':
   variable_lst = [
-    "100m_u_component_of_wind",
-    "100m_v_component_of_wind",
+    # "100m_u_component_of_wind",
+    # "100m_v_component_of_wind",
     "10m_u_component_of_wind",
-    "10m_v_component_of_wind",
-    "2m_dewpoint_temperature",
+    # "10m_v_component_of_wind",
+    # "2m_dewpoint_temperature",
     "2m_temperature",
-    "ice_temperature_layer_1",
-    "ice_temperature_layer_2",
+    # "ice_temperature_layer_1",
+    # "ice_temperature_layer_2",
     "ice_temperature_layer_3",
-    "ice_temperature_layer_4",
-    "maximum_2m_temperature_since_previous_post_processing",
+    # "ice_temperature_layer_4",
+    # "maximum_2m_temperature_since_previous_post_processing",
     "mean_sea_level_pressure",
-    "minimum_2m_temperature_since_previous_post_processing",
-    "sea_surface_temperature",
+    # "minimum_2m_temperature_since_previous_post_processing",
+    # "sea_surface_temperature",
     "skin_temperature",
-    "surface_pressure",
-    "total_precipitation",
+    # "surface_pressure",
+    # "total_precipitation",
   ]
 
   # global value
   for variable_idx in range(len(variable_lst)):
     variable = variable_lst[variable_idx]
+    era5_path = f'/capstor/scratch/cscs/ljiayong/datasets/ERA5_large'
     output_path = f'/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/test'
     os.makedirs(output_path, exist_ok = True)
-
-    # '''
-    # Step 1: NetCDF to HDF5 without compression
-    # '''
-    # print(f'[INFO] Converting NetCDF to HDF5 for Variable {variable} ......')
-    # nc_file = f'/capstor/scratch/cscs/ljiayong/datasets/ERA5/reanalysis/{variable}.nc'
-    # hdf5_file = os.path.join(output_path, f'{variable}.hdf5')
-    # convert_nc_to_hdf5(nc_file, hdf5_file)
-
-
-    # '''
-    # Step 2: Interpolate Ensemble Spread
-    # '''
-    # print(f'[INFO] Interpolating Ensemble Spread for Variable {variable} ......')
-    # reanalysis_file = f'/capstor/scratch/cscs/ljiayong/datasets/ERA5/reanalysis/{variable}.nc'
-    # ensemble_file = f'/capstor/scratch/cscs/ljiayong/datasets/ERA5/ensemble_spread/{variable}.nc'
-    # output_file = os.path.join(output_path, f'{variable}_interpolated_ensemble_spread.hdf5')
-    # interpolate_ensemble_to_reanalysis(reanalysis_file, ensemble_file, output_file)
 
     '''
     Param Combinations
     '''
     ebcc_pointwise_max_error_ratio_lst = [0.1, 0.5, 1]
-    # ebcc_pointwise_max_error_ratio_lst = [1]
+    ebcc_pointwise_max_error_ratio_lst = [1]
     checkpoint_path1_lst=[
-      '/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/pretrained/lic_tcm_n_64_lambda_0.05.pth.tar',
+      # '/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/pretrained/lic_tcm_n_64_lambda_0.05.pth.tar',
       # '/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/pretrained/lic_tcm_n_128_lambda_0.05.pth.tar',
       # '/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/checkpoints_era5_20/N_128_lambda_0.05/checkpoint_best.pth.tar',
       # '/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/checkpoints_era5_full_res_1/N_128_lambda_0.05/checkpoint_best.pth.tar',
       # '/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/checkpoints_era5_full_res_finetune/N_64_lambda_0.05/checkpoint_best.pth.tar',
-      # '/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/checkpoints_weighted_fintune/N_64_lambda_0.05/checkpoint_best.pth.tar',
+      f'/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/checkpoints_weighted_finetune/N_64_lambda_0.05_{variable}/checkpoint_best.pth.tar',
       # '/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/checkpoints_weighted_rand_init/N_64_lambda_0.05/checkpoint_best.pth.tar',
     ]
-    # checkpoint_path2_lst=['/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/pretrained/lic_tcm_n_128_lambda_0.05.pth.tar']
-    checkpoint_path2_lst=[None]
+    checkpoint_path2_lst=['/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/pretrained/lic_tcm_n_128_lambda_0.05.pth.tar']
+    # checkpoint_path2_lst=[None]
     # checkpoint_path1_lst=['/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/checkpoints_weighted_fintune/N_64_lambda_0.05/checkpoint_best.pth.tar']
     # checkpoint_path2_lst=[
     #   '/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/pretrained/lic_tcm_n_64_lambda_0.05.pth.tar',
@@ -437,7 +327,7 @@ if __name__ == '__main__':
     #   '/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/checkpoints_weighted_fintune/N_64_lambda_0.05/checkpoint_best.pth.tar',
     #   '/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/checkpoints_weighted_rand_init/N_64_lambda_0.05/checkpoint_best.pth.tar',
     # ]
-    param_combinations = list(itertools.product([output_path], [variable], ebcc_pointwise_max_error_ratio_lst, checkpoint_path1_lst, checkpoint_path2_lst))
+    param_combinations = list(itertools.product([output_path], [era5_path], [variable], ebcc_pointwise_max_error_ratio_lst, checkpoint_path1_lst, checkpoint_path2_lst))
     
     '''
     Step 3: Run LIC_TCM with Pointwise Error Bound
@@ -453,7 +343,7 @@ if __name__ == '__main__':
     # Convert results to a structured DataFrame
     results_df = pd.DataFrame(results)
 
-    results_df.to_csv(f'./results/error_bound_pipeline_test/{variable}_lic_tcm_pointwise_compression.csv', index=False)
+    results_df.to_csv(f'./results/error_bound_pipeline_test/{variable}_sep_lic_tcm_pointwise_compression.csv', index=False)
 
     # '''
     # Step 4: Plot Compression Error Distribution

@@ -368,10 +368,23 @@ def main():
   params
   '''
   variable_lst = [
+    "100m_u_component_of_wind",
+    "100m_v_component_of_wind",
     "10m_u_component_of_wind",
-    # "10m_v_component_of_wind",
-    # "2m_temperature",
-    # "total_precipitation"
+    "10m_v_component_of_wind",
+    "2m_dewpoint_temperature",
+    "2m_temperature",
+    "ice_temperature_layer_1",
+    "ice_temperature_layer_2",
+    "ice_temperature_layer_3",
+    "ice_temperature_layer_4",
+    "maximum_2m_temperature_since_previous_post_processing",
+    "mean_sea_level_pressure",
+    "minimum_2m_temperature_since_previous_post_processing",
+    "sea_surface_temperature",
+    "skin_temperature",
+    "surface_pressure",
+    "total_precipitation",
   ]
 
   n_lst = ["64", "128"]
@@ -399,7 +412,7 @@ def main():
             ckpt_name = f"{label}_checkpoint.pth.tar"
           except:
             ckpt_name = f"checkpoint_{label}.pth.tar"
-          checkpoint = f"/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/checkpoints_weighted_fintune/N_{n}_lambda_{_lambda}/{ckpt_name}"
+          checkpoint = f"/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/checkpoints_weighted_finetune/N_{n}_lambda_{_lambda}_{variable}/{ckpt_name}"
           # checkpoint = f"/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/checkpoints_era5_full_res_finetune/N_{n}_lambda_{_lambda}/{ckpt_name}"
           # checkpoint = f"/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/pretrained/lic_tcm_n_64_lambda_0.05.pth.tar"
           if os.path.exists(checkpoint):

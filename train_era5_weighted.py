@@ -520,7 +520,9 @@ def main(argv):
   for arg in vars(args):
     print(arg, ":", getattr(args, arg))
   type = args.type
-  save_path = os.path.join(args.save_path, f"N_{args.N}_lambda_{str(args.lmbda)}")
+  variable = args.variable
+  print(f"[INFO] Launch training for variable {variable}")
+  save_path = os.path.join(args.save_path, f"N_{args.N}_lambda_{str(args.lmbda)}_{variable}")
   if not os.path.exists(save_path):
     os.makedirs(save_path)
     os.makedirs(os.path.join(save_path, "tensorboard"))
@@ -532,10 +534,8 @@ def main(argv):
   os.environ['CUBLAS_WORKSPACE_CONFIG'] = ":4096:8"
   torch.use_deterministic_algorithms(True)
   # datasets
-  variable = "10m_u_component_of_wind"
   train_dataset = Era5ReanalysisDataset(variable=variable, batch_size=args.batch_size, patch_size=args.patch_size, split='train')
   valid_dataset = Era5ReanalysisDataset(variable=variable, batch_size=8, split='valid')
-
 
   device = 'cuda:0'
 
