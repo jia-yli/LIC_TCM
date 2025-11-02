@@ -9,6 +9,7 @@ from compressai.layers import (
     conv3x3,
     subpel_conv3x3,
 )
+from .cross_image_attn import SwinCrossBlock
 
 import torch.nn as nn
 import torch.nn.functional as F
@@ -307,7 +308,82 @@ class SwinBlock(nn.Module):
             x = F.pad(x, (-padding_col, -padding_col-1, -padding_row, -padding_row-1))
         return trans_x
 
-class TCM(CompressionModel):
+class GA(nn.Module):
+    def __init__(self, config, head_dim, window_size, drop_path_rate, N, M):
+        super().__init__()
+        self.config = config
+        self.head_dim = head_dim
+        self.window_size = window_size
+        dim = N
+        self.M = M
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(config))]
+        begin = 0
+
+        # for x
+        self.layer1 = ResidualBlockWithStride(3, 2*N, 2)
+        self.m1 = nn.Sequential(*[ConvTransBlock(dim, dim, self.head_dim[0], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') for i in range(config[0])])
+        self.down1 = ResidualBlockWithStride(2*N, 2*N, stride=2)
+        self.m2 = nn.Sequential(*[ConvTransBlock(dim, dim, self.head_dim[1], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') for i in range(config[1])])
+        self.down2 = ResidualBlockWithStride(2*N, 2*N, stride=2)
+        self.m3 = nn.Sequential(*[ConvTransBlock(dim, dim, self.head_dim[2], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') for i in range(config[2])])
+        self.down3 = conv3x3(2*N, M, stride=2)
+
+        # cross attn
+        self.cross1 = SwinCrossBlock(2*N, 2*N, 16, self.window_size, 0)
+        self.cross2 = SwinCrossBlock(2*N, 2*N, 16, self.window_size, 0)
+        self.cross3 = SwinCrossBlock(2*N, 2*N, 16, self.window_size, 0)
+    
+    def forward(self, x):
+        # layer 1
+        x = self.layer1(x)
+        for idx in range(1, 4):
+            # m
+            x = eval(f"self.m{idx}")(x)
+            x = eval(f"self.cross{idx}")(x)
+            # down
+            x = eval(f"self.down{idx}")(x)
+        
+        return x
+
+class GS(nn.Module):
+    def __init__(self, config, head_dim, window_size, drop_path_rate, N, M):
+        super().__init__()
+        self.config = config
+        self.head_dim = head_dim
+        self.window_size = window_size
+        dim = N
+        self.M = M
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(config))]
+        begin = 0
+
+        # for x
+        self.layer1 = ResidualBlockUpsample(M, 2*N, 2)
+        self.m1 = nn.Sequential(*[ConvTransBlock(dim, dim, self.head_dim[3], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') for i in range(config[3])])
+        self.up1 = ResidualBlockUpsample(2*N, 2*N, 2)
+        self.m2 = nn.Sequential(*[ConvTransBlock(dim, dim, self.head_dim[4], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') for i in range(config[4])])
+        self.up2 = ResidualBlockUpsample(2*N, 2*N, 2)
+        self.m3 = nn.Sequential(*[ConvTransBlock(dim, dim, self.head_dim[5], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') for i in range(config[5])])
+        self.up3 = subpel_conv3x3(2*N, 3, 2)
+
+        # cross attn
+        self.cross1 = SwinCrossBlock(2*N, 2*N, 16, self.window_size, 0)
+        self.cross2 = SwinCrossBlock(2*N, 2*N, 16, self.window_size, 0)
+        self.cross3 = SwinCrossBlock(2*N, 2*N, 16, self.window_size, 0)
+    
+    def forward(self, x):
+        # layer 1
+        x = self.layer1(x)
+        for idx in range(1, 4):
+            # m
+            x = eval(f"self.m{idx}")(x)
+            # cross
+            x = eval(f"self.cross{idx}")(x)
+            # up
+            x = eval(f"self.up{idx}")(x)
+        
+        return x
+
+class TCMWeighted(CompressionModel):
     def __init__(self, config=[2, 2, 2, 2, 2, 2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0, N=128,  M=320, num_slices=5, max_support_slices=5, **kwargs):
         super().__init__(entropy_bottleneck_channels=N)
         self.config = config
@@ -320,30 +396,9 @@ class TCM(CompressionModel):
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(config))]
         begin = 0
 
-        self.m_down1 = [ConvTransBlock(dim, dim, self.head_dim[0], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') 
-                      for i in range(config[0])] + \
-                      [ResidualBlockWithStride(2*N, 2*N, stride=2)]
-        self.m_down2 = [ConvTransBlock(dim, dim, self.head_dim[1], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW')
-                      for i in range(config[1])] + \
-                      [ResidualBlockWithStride(2*N, 2*N, stride=2)]
-        self.m_down3 = [ConvTransBlock(dim, dim, self.head_dim[2], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW')
-                      for i in range(config[2])] + \
-                      [conv3x3(2*N, M, stride=2)]
+        self.g_a = GA(config, head_dim, self.window_size, drop_path_rate, N, M)
 
-        self.m_up1 = [ConvTransBlock(dim, dim, self.head_dim[3], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') 
-                      for i in range(config[3])] + \
-                      [ResidualBlockUpsample(2*N, 2*N, 2)]
-        self.m_up2 = [ConvTransBlock(dim, dim, self.head_dim[4], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') 
-                      for i in range(config[4])] + \
-                      [ResidualBlockUpsample(2*N, 2*N, 2)]
-        self.m_up3 = [ConvTransBlock(dim, dim, self.head_dim[5], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') 
-                      for i in range(config[5])] + \
-                      [subpel_conv3x3(2*N, 3, 2)]
-        
-        self.g_a = nn.Sequential(*[ResidualBlockWithStride(3, 2*N, 2)] + self.m_down1 + self.m_down2 + self.m_down3)
-        
-
-        self.g_s = nn.Sequential(*[ResidualBlockUpsample(M, 2*N, 2)] + self.m_up1 + self.m_up2 + self.m_up3)
+        self.g_s = GS(config, head_dim, self.window_size, drop_path_rate, N, M)
 
         self.ha_down1 = [ConvTransBlock(N, N, 32, 4, 0, 'W' if not i%2 else 'SW') 
                       for i in range(config[0])] + \
@@ -414,7 +469,36 @@ class TCM(CompressionModel):
         )
 
         self.entropy_bottleneck = EntropyBottleneck(192)
+        self.entropy_bottleneck_b = EntropyBottleneck(M)
         self.gaussian_conditional = GaussianConditional(None)
+
+        self.freeze_pretrained_modules = False
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.freeze_pretrained_modules:
+            # Force frozen modules to eval mode (prevent BN/Dropout updates)
+            frozen_module_lst = []
+            for name, module in self.named_children():
+                if name not in ["g_a", "g_s", "entropy_bottleneck_b"]:
+                    frozen_module_lst.append(module)
+
+            frozen_module_lst.append(self.g_a.layer1)
+            for idx in range(1, 4):
+                frozen_module_lst.append(eval(f"self.g_a.m{idx}"))
+                frozen_module_lst.append(eval(f"self.g_a.down{idx}"))
+
+            frozen_module_lst.append(self.g_s.layer1)
+            for idx in range(1, 4):
+                frozen_module_lst.append(eval(f"self.g_s.m{idx}"))
+                frozen_module_lst.append(eval(f"self.g_s.up{idx}"))
+
+            for module in frozen_module_lst:
+                module.eval()
+                # Ensure parameters remain frozen
+                for p in module.parameters():
+                    p.requires_grad = False
+        return self
 
     def update(self, scale_table=None, force=False):
         if scale_table is None:
@@ -423,8 +507,10 @@ class TCM(CompressionModel):
         updated |= super().update(force=force)
         return updated
     
-    def forward(self, x):
-        y = self.g_a(x)
+    def forward(self, x, b):
+        batch_size = x.shape[0]
+        y = self.g_a(torch.cat([x, b], dim=0))
+        y, y_b = y[:batch_size], y[batch_size:]
         y_shape = y.shape[2:]
         z = self.h_a(y)
         _, z_likelihoods = self.entropy_bottleneck(z)
@@ -432,6 +518,12 @@ class TCM(CompressionModel):
         z_offset = self.entropy_bottleneck._get_medians()
         z_tmp = z - z_offset
         z_hat = ste_round(z_tmp) + z_offset
+
+        _, y_b_likelihoods = self.entropy_bottleneck_b(y_b)
+
+        y_b_offset = self.entropy_bottleneck_b._get_medians()
+        y_b_tmp = y_b - y_b_offset
+        y_b_hat = ste_round(y_b_tmp) + y_b_offset
 
         latent_scales = self.h_scale_s(z_hat)
         latent_means = self.h_mean_s(z_hat)
@@ -470,13 +562,15 @@ class TCM(CompressionModel):
         means = torch.cat(mu_list, dim=1)
         scales = torch.cat(scale_list, dim=1)
         y_likelihoods = torch.cat(y_likelihood, dim=1)
-        x_hat = self.g_s(y_hat)
+        x_hat = self.g_s(torch.cat([y_hat, y_b_hat], dim=0))
+        x_hat = x_hat[:batch_size]
 
         return {
             "x_hat": x_hat,
-            "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
+            "likelihoods": {"y": y_likelihoods, "z": z_likelihoods, "y_b": y_b_likelihoods},
             "para":{"means": means, "scales":scales, "y":y}
         }
+
 
     def load_state_dict(self, state_dict):
         update_registered_buffers(
@@ -498,12 +592,17 @@ class TCM(CompressionModel):
         return net
 
     def compress(self, x):
-        y = self.g_a(x)
+        batch_size = x.shape[0]
+        y = self.g_a(torch.cat([x, b], dim=0))
+        y, y_b = y[:batch_size], y[batch_size:]
         y_shape = y.shape[2:]
 
         z = self.h_a(y)
         z_strings = self.entropy_bottleneck.compress(z)
         z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
+
+        y_b_strings = self.entropy_bottleneck_b.compress(y_b)
+        y_b_hat = self.entropy_bottleneck.decompress(y_b_strings, y_b.size()[-2:])
 
         latent_scales = self.h_scale_s(z_hat)
         latent_means = self.h_mean_s(z_hat)
@@ -556,7 +655,8 @@ class TCM(CompressionModel):
         y_string = encoder.flush()
         y_strings.append(y_string)
 
-        return {"strings": [y_strings, z_strings], "shape": z.size()[-2:]}
+        return {"strings": [y_strings, z_strings, y_b_strings], "shape": [z.size()[-2:], y_b.size()[-2:]]}
+
 
     def _likelihood(self, inputs, scales, means=None):
         half = float(0.5)
@@ -579,7 +679,8 @@ class TCM(CompressionModel):
         return half * torch.erfc(const * inputs)
 
     def decompress(self, strings, shape):
-        z_hat = self.entropy_bottleneck.decompress(strings[1], shape)
+        z_hat = self.entropy_bottleneck.decompress(strings[1], shape[0]) 
+        y_b_hat = self.entropy_bottleneck_b.decompress(strings[2], shape[1])
         latent_scales = self.h_scale_s(z_hat)
         latent_means = self.h_mean_s(z_hat)
 
@@ -621,6 +722,7 @@ class TCM(CompressionModel):
             y_hat_slices.append(y_hat_slice)
 
         y_hat = torch.cat(y_hat_slices, dim=1)
-        x_hat = self.g_s(y_hat).clamp_(0, 1)
+        x_hat = self.g_s(torch.cat([y_hat, y_b_hat], dim=0)).clamp_(0, 1)
+        x_hat = x_hat[:batch_size]
 
         return {"x_hat": x_hat}
