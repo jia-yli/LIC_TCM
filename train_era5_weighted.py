@@ -14,7 +14,7 @@ from compressai.datasets import ImageFolder
 from compressai.zoo import models
 from pytorch_msssim import ms_ssim
 
-from models import TCM
+from models import TCM, TCMWeighted
 from torch.utils.tensorboard import SummaryWriter   
 import os
 import xarray as xr
@@ -300,7 +300,7 @@ def train_one_epoch(
     d_padded, padding = pad(d, 128, 0)
     b_padded, padding = pad(b, 128, 1)
 
-    out_net = model(d_padded)
+    out_net = model(d_padded, b_padded)
 
     out_net["x_hat"] = out_net["x_hat"].mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
     out_net["x_hat"] = crop(out_net["x_hat"], padding)
@@ -320,19 +320,19 @@ def train_one_epoch(
         print(
           f"Lambda {criterion.lmbda} Train epoch {epoch}: ["
           f"{i*len(d)} Samples]"
-          f'\tLoss: {out_criterion["loss"].item():.3f} |'
-          f'\tMSE loss: {out_criterion["mse_loss"].item():.3f} |'
-          f'\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |'
-          f"\tAux loss: {aux_loss.item():.2f}"
+          f' Loss: {out_criterion["loss"].item()} |'
+          f' MSE loss: {out_criterion["mse_loss"].item()} |'
+          f' Bpp loss: {out_criterion["bpp_loss"].item()} |'
+          f" Aux loss: {aux_loss.item()}"
         )
       else:
         print(
           f"Lambda {criterion.lmbda} Train epoch {epoch}: ["
           f"{i*len(d)} Samples]"
-          f'\tLoss: {out_criterion["loss"].item():.3f} |'
-          f'\tMS_SSIM loss: {out_criterion["ms_ssim_loss"].item():.3f} |'
-          f'\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |'
-          f"\tAux loss: {aux_loss.item():.2f}"
+          f' Loss: {out_criterion["loss"].item()} |'
+          f' MS_SSIM loss: {out_criterion["ms_ssim_loss"].item()} |'
+          f' Bpp loss: {out_criterion["bpp_loss"].item()} |'
+          f" Aux loss: {aux_loss.item()}"
         )
     i += 1
     if is_epoch_finished:
@@ -359,7 +359,7 @@ def valid_epoch(epoch, valid_dataloader, model, criterion, type='mse'):
         d_padded, padding = pad(d, 128, 0)
         b_padded, padding = pad(b, 128, 1)
 
-        out_net = model(d_padded)
+        out_net = model(d_padded, b_padded)
 
         out_net["x_hat"] = out_net["x_hat"].mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
         out_net["x_hat"] = crop(out_net["x_hat"], padding)
@@ -374,10 +374,10 @@ def valid_epoch(epoch, valid_dataloader, model, criterion, type='mse'):
 
     print(
       f"Valid epoch {epoch}: Average losses:"
-      f"\tLoss: {loss.avg:.3f} |"
-      f"\tMSE loss: {mse_loss.avg:.3f} |"
-      f"\tBpp loss: {bpp_loss.avg:.2f} |"
-      f"\tAux loss: {aux_loss.avg:.2f}\n"
+      f" Loss: {loss.avg} |"
+      f" MSE loss: {mse_loss.avg} |"
+      f" Bpp loss: {bpp_loss.avg} |"
+      f" Aux loss: {aux_loss.avg}\n"
     )
 
   else:
@@ -406,10 +406,10 @@ def valid_epoch(epoch, valid_dataloader, model, criterion, type='mse'):
 
     print(
       f"Valid epoch {epoch}: Average losses:"
-      f"\tLoss: {loss.avg:.3f} |"
-      f"\tMS_SSIM loss: {ms_ssim_loss.avg:.3f} |"
-      f"\tBpp loss: {bpp_loss.avg:.2f} |"
-      f"\tAux loss: {aux_loss.avg:.2f}\n"
+      f" Loss: {loss.avg} |"
+      f" MS_SSIM loss: {ms_ssim_loss.avg} |"
+      f" Bpp loss: {bpp_loss.avg} |"
+      f" Aux loss: {aux_loss.avg}\n"
     )
 
   return loss.avg
@@ -511,6 +511,9 @@ def parse_args(argv):
   parser.add_argument(
     "--continue-train", action="store_true"
   )
+  parser.add_argument(
+    "--freeze-tcm", action="store_true"
+  )
   args = parser.parse_args(argv)
   return args
 
@@ -543,7 +546,11 @@ def main(argv):
 
   valid_dataloader = valid_dataset
 
-  net = TCM(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=args.N, M=320)
+  # net = TCM(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=args.N, M=320)
+  net = TCMWeighted(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=args.N, M=320)
+  if args.freeze_tcm:
+    print("tcm modules are freezed")
+    net.freeze_tcm_modules = True
   net = net.to(device)
 
   optimizer, aux_optimizer = configure_optimizers(net, args)

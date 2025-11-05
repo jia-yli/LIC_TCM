@@ -51,20 +51,24 @@ class RateDistortionLoss(nn.Module):
 
     return out
 
-def normalize_weight_arr(weight, thr=10):
-  # [N, C, H, W]
-  rms = np.sqrt(np.mean(weight**2, axis=(1,2,3), keepdims=True))
-  weight_norm = np.clip(weight / rms, 1/thr, thr)
-  weight01 = np.log(weight_norm) / np.log(thr) # [-1, 1]
-  weight01 = (weight01 + 1) / 2 # [0, 1]
-  return weight_norm, weight01
+# def normalize_weight_arr(weight, thr=10):
+#   # [N, C, H, W]
+#   rms = np.sqrt(np.mean(weight**2, axis=(1,2,3), keepdims=True))
+#   weight_norm = np.clip(weight / rms, 1/thr, thr)
+#   weight01 = np.log(weight_norm) / np.log(thr) # [-1, 1]
+#   weight01 = (weight01 + 1) / 2 # [0, 1]
+#   return weight_norm, weight01
 
-def normalize_weight_tensor(weight, thr=10):
+def normalize_weight_tensor(weight, thr, use_log_norm_weight):
   # [N, C, H, W]
-  rms = torch.sqrt(torch.mean(weight ** 2, dim=(1, 2, 3), keepdim=True))
-  weight_norm = torch.clamp(weight / rms, 1/thr, thr)
-  weight01 = torch.log(weight_norm) / np.log(thr)
-  weight01 = (weight01 + 1) / 2
+  if use_log_norm_weight:
+    log_avg = torch.exp(torch.log(weight + 1e-6).mean(dim=(1, 2, 3), keepdim=True))
+    weight_norm = torch.clamp(weight / log_avg, 1/thr, thr)
+    weight01 = torch.log(weight_norm) / np.log(thr)
+  else:
+    rms = torch.sqrt(torch.mean(weight ** 2, dim=(1, 2, 3), keepdim=True))
+    weight_norm = torch.clamp(weight / rms, 1/thr, thr)
+    weight01 = torch.log(weight_norm) / np.log(thr)
   return weight_norm, weight01
 
 
@@ -129,7 +133,7 @@ def configure_optimizers(net, args):
 
 
 def train_one_epoch(
-  model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, weighted_ratio
+  model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, weighted_ratio, freeze_aux_loss, use_gray_scale_weight, use_log_norm_weight
 ):
   model.train()
   device = next(model.parameters()).device
@@ -139,10 +143,12 @@ def train_one_epoch(
     x = d[:batch_size].to(device)
 
     b = d[-batch_size:].to(device)
+    if use_gray_scale_weight:
+      b = b * 0 + b.mean(dim=1, keepdim=True)
     plain_mask = torch.rand(batch_size, device=b.device) >= weighted_ratio
     b[plain_mask, ...] = 1
 
-    b_norm, b01 = normalize_weight_tensor(b)
+    b_norm, b01 = normalize_weight_tensor(b, 10, use_log_norm_weight)
     optimizer.zero_grad()
     aux_optimizer.zero_grad()
 
@@ -155,8 +161,9 @@ def train_one_epoch(
     optimizer.step()
 
     aux_loss = model.aux_loss()
-    aux_loss.backward()
-    aux_optimizer.step()
+    if not freeze_aux_loss:
+      aux_loss.backward()
+      aux_optimizer.step()
 
     if i % 100 == 0:
       print(
@@ -170,7 +177,7 @@ def train_one_epoch(
       )
 
 
-def valid_epoch(epoch, valid_dataloader, model, criterion, mode='plain'):
+def valid_epoch(epoch, valid_dataloader, model, criterion, mode, use_gray_scale_weight, use_log_norm_weight):
   model.eval()
   device = next(model.parameters()).device
 
@@ -183,10 +190,13 @@ def valid_epoch(epoch, valid_dataloader, model, criterion, mode='plain'):
     for d in valid_dataloader:
       batch_size = len(d)//2
       x = d[:batch_size].to(device)
+      b = d[-batch_size:].to(device)
+      if use_gray_scale_weight:
+        b = b * 0 + b.mean(dim=1, keepdim=True)
       if mode == 'plain':
-        b_norm, b01 = normalize_weight_tensor(d[-batch_size:].to(device)*0+1)
+        b_norm, b01 = normalize_weight_tensor(b * 0 + 1, 10, use_log_norm_weight)
       elif mode == "weighted":
-        b_norm, b01 = normalize_weight_tensor(d[-batch_size:].to(device))
+        b_norm, b01 = normalize_weight_tensor(b, 10, use_log_norm_weight)
       else:
         raise ValueError(f"Unsupported mode {mode}")
 
@@ -201,10 +211,10 @@ def valid_epoch(epoch, valid_dataloader, model, criterion, mode='plain'):
   result = {
     "epoch": epoch,
     "mode": mode,
-    "loss": loss.avg,
-    "mse": mse_loss.avg,
-    "bpp": bpp_loss.avg,
-    "aux": aux_loss.avg
+    "loss": loss.avg.item(),
+    "mse": mse_loss.avg.item(),
+    "bpp": bpp_loss.avg.item(),
+    "aux": aux_loss.avg.item()
   }
 
   print(
@@ -213,7 +223,7 @@ def valid_epoch(epoch, valid_dataloader, model, criterion, mode='plain'):
     f" Loss: {loss.avg} |"
     f" MSE loss: {mse_loss.avg} |"
     f" Bpp loss: {bpp_loss.avg} |"
-    f" Aux loss: {aux_loss.avg}\n"
+    f" Aux loss: {aux_loss.avg}"
   )
 
   return result
@@ -221,8 +231,8 @@ def valid_epoch(epoch, valid_dataloader, model, criterion, mode='plain'):
 
 def save_checkpoint(state, is_best, epoch, save_path, filename):
   torch.save(state, os.path.join(save_path, "checkpoint_latest.pth.tar"))
-  # if epoch % 5 == 0:
-  torch.save(state, filename)
+  if epoch % 3 == 0:
+    torch.save(state, filename)
   if is_best:
     torch.save(state, os.path.join(save_path, "checkpoint_best.pth.tar"))
 
@@ -306,6 +316,15 @@ def parse_args(argv):
   parser.add_argument(
     "--weighted-ratio", type=float, default=0.5
   )
+  parser.add_argument(
+    "--use-gray-scale-weight", type=int, default=0
+  )
+  parser.add_argument(
+    "--use-log-norm-weight", type=int, default=0
+  )
+  parser.add_argument(
+    "--use-weight-in-decoder", type=int, default=0
+  )
   args = parser.parse_args(argv)
   return args
 
@@ -356,7 +375,7 @@ def main(argv):
   )
 
   # net = TCM(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=args.N, M=320)
-  net = TCMWeighted(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=args.N, M=320)
+  net = TCMWeighted(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=args.N, M=320, use_weight_in_decoder=args.use_weight_in_decoder)
   if args.freeze_pretrained:
     print("[INFO] Pretrained modules are freezed")
     net.freeze_pretrained_modules = True
@@ -412,10 +431,13 @@ def main(argv):
       aux_optimizer,
       epoch,
       args.clip_max_norm,
-      args.weighted_ratio
+      args.weighted_ratio,
+      freeze_aux_loss = args.freeze_pretrained and not args.use_weight_in_decoder,
+      use_gray_scale_weight = args.use_gray_scale_weight,
+      use_log_norm_weight = args.use_log_norm_weight
     )
-    valid_result_weighted = valid_epoch(epoch, valid_dataloader, net, criterion, "weighted")
-    valid_result_plain = valid_epoch(epoch, valid_dataloader, net, criterion, "plain")
+    valid_result_weighted = valid_epoch(epoch, valid_dataloader, net, criterion, mode="weighted", use_gray_scale_weight=args.use_gray_scale_weight, use_log_norm_weight=args.use_log_norm_weight)
+    valid_result_plain = valid_epoch(epoch, valid_dataloader, net, criterion, mode="plain", use_gray_scale_weight=args.use_gray_scale_weight, use_log_norm_weight=args.use_log_norm_weight)
     results.append(valid_result_weighted)
     results.append(valid_result_plain)
     loss = valid_result_weighted["loss"]

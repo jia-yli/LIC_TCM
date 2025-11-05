@@ -9,7 +9,7 @@
 #SBATCH --cpus-per-task=128               # Number of CPU cores per task
 #SBATCH --mem=256G                        # Memory allocation
 #SBATCH --gpus=4                          # Number of GPUs
-#SBATCH --time=12:00:00                    # Time limit
+#SBATCH --time=8:00:00                    # Time limit
 
 # Print detailed job metadata
 JOB_TIME_LIMIT=$(squeue -j $SLURM_JOB_ID -h --Format TimeLimit)

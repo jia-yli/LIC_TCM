@@ -95,14 +95,14 @@ def update_registered_buffers(
             dtype,
         )
 
-def main(tcm_ckpt_path, tcm_weighted_ckpt_path):
+def main(tcm_ckpt_path, tcm_weighted_ckpt_path, use_weight_in_decoder):
   assert tcm_ckpt_path != tcm_weighted_ckpt_path
   all_tcm_ckpts = sorted([f for f in os.listdir(tcm_ckpt_path) if f.endswith('.pth.tar')])
   for tcm_ckpt_file in tqdm(all_tcm_ckpts):
     match_n = re.search(r'[nN]_(\d+)', tcm_ckpt_file)
     N = int(match_n.group(1))
     net_tcm = TCM(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=N, M=320)
-    net_tcm_weighted = TCMWeighted(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=N, M=320)
+    net_tcm_weighted = TCMWeighted(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=N, M=320, use_weight_in_decoder=use_weight_in_decoder)
     
     # load tcm
     tcm_checkpoint = torch.load(os.path.join(tcm_ckpt_path, tcm_ckpt_file))
@@ -153,5 +153,6 @@ def main(tcm_ckpt_path, tcm_weighted_ckpt_path):
 
 if __name__ == "__main__":
   tcm_ckpt_path = "/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/pretrained"
-  tcm_weighted_ckpt_path = "/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/pretrained_tcm_weighted"
-  main(tcm_ckpt_path, tcm_weighted_ckpt_path)
+  for use_weight_in_decoder in [0, 1]:
+    tcm_weighted_ckpt_path = f"/capstor/scratch/cscs/ljiayong/workspace/LIC_TCM/pretrained_tcm_weighted_wd{use_weight_in_decoder}"
+    main(tcm_ckpt_path, tcm_weighted_ckpt_path, use_weight_in_decoder)
