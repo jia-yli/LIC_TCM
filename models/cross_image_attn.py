@@ -69,8 +69,8 @@ class WMCA(nn.Module):
         qkv_b = self.embedding_layer_b(b)
         q, k, v = rearrange(qkv, 'b nw np (threeh c) -> threeh b nw np c', c=self.head_dim).chunk(3, dim=0)
         q_b, k_b, v_b = rearrange(qkv_b, 'b nw np (threeh c) -> threeh b nw np c', c=self.head_dim).chunk(3, dim=0)
-        q_, k_, v_ = q_b, k, v
-        # q_, k_, v_ = q, k_b, v_b
+        # q_, k_, v_ = q_b, k, v
+        q_, k_, v_ = q, k_b, v_b # condition on b
         sim = torch.einsum('hbwpc,hbwqc->hbwpq', q_, k_) * self.scale
         sim = sim + rearrange(self.relative_embedding(), 'h p q -> h 1 1 p q')
         if self.type != 'W':
@@ -124,9 +124,9 @@ class SwinCrossBlock(nn.Module):
         self.cross_block_2 = CrossBlock(input_dim, output_dim, head_dim, window_size, drop_path, type='SW')
         self.window_size = window_size
 
-    def forward(self, x):
-        batch_size = x.shape[0] // 2
-        x, b = x[:batch_size], x[batch_size:]
+    def forward(self, x, b):
+        # batch_size = x.shape[0] // 2
+        # x, b = x[:batch_size], x[batch_size:]
         resize = False
         if (x.size(-1) <= self.window_size) or (x.size(-2) <= self.window_size):
             padding_row = (self.window_size - x.size(-2)) // 2
@@ -139,4 +139,5 @@ class SwinCrossBlock(nn.Module):
         trans_x =  self.cross_block_2(trans_x, trans_b)
         trans_x = Rearrange('b h w c -> b c h w')(trans_x)
         trans_b = Rearrange('b h w c -> b c h w')(trans_b)
-        return torch.cat([trans_x, trans_b], dim=0)
+        return trans_x
+        # return torch.cat([trans_x, trans_b], dim=0)

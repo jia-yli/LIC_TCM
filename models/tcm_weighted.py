@@ -328,25 +328,38 @@ class GA(nn.Module):
         self.m3 = nn.Sequential(*[ConvTransBlock(dim, dim, self.head_dim[2], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') for i in range(config[2])])
         self.down3 = conv3x3(2*N, M, stride=2)
 
+        # for b
+        self.layer1_b = ResidualBlockWithStride(3, 2*N, 2)
+        self.m1_b = nn.Sequential(*[ConvTransBlock(dim, dim, self.head_dim[0], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') for i in range(config[0])])
+        self.down1_b = ResidualBlockWithStride(2*N, 2*N, stride=2)
+        self.m2_b = nn.Sequential(*[ConvTransBlock(dim, dim, self.head_dim[1], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') for i in range(config[1])])
+        self.down2_b = ResidualBlockWithStride(2*N, 2*N, stride=2)
+        self.m3_b = nn.Sequential(*[ConvTransBlock(dim, dim, self.head_dim[2], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') for i in range(config[2])])
+        self.down3_b = conv3x3(2*N, M, stride=2)
+
         # cross attn
         self.cross1 = SwinCrossBlock(2*N, 2*N, 16, self.window_size, 0)
         self.cross2 = SwinCrossBlock(2*N, 2*N, 16, self.window_size, 0)
         self.cross3 = SwinCrossBlock(2*N, 2*N, 16, self.window_size, 0)
     
-    def forward(self, x):
+    def forward(self, x, b):
         # layer 1
         x = self.layer1(x)
+        b = self.layer1_b(b)
         for idx in range(1, 4):
             # m
             x = eval(f"self.m{idx}")(x)
-            x = eval(f"self.cross{idx}")(x)
+            b = eval(f"self.m{idx}_b")(b)
+            # cross
+            x = eval(f"self.cross{idx}")(x, b)
             # down
             x = eval(f"self.down{idx}")(x)
+            b = eval(f"self.down{idx}_b")(b)
         
-        return x
+        return x, b
 
 class GS(nn.Module):
-    def __init__(self, config, head_dim, window_size, drop_path_rate, N, M):
+    def __init__(self, config, head_dim, window_size, drop_path_rate, N, M, use_weight_in_decoder=0):
         super().__init__()
         self.config = config
         self.head_dim = head_dim
@@ -365,23 +378,39 @@ class GS(nn.Module):
         self.m3 = nn.Sequential(*[ConvTransBlock(dim, dim, self.head_dim[5], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') for i in range(config[5])])
         self.up3 = subpel_conv3x3(2*N, 3, 2)
 
-        # cross attn
-        self.cross1 = SwinCrossBlock(2*N, 2*N, 16, self.window_size, 0)
-        self.cross2 = SwinCrossBlock(2*N, 2*N, 16, self.window_size, 0)
-        self.cross3 = SwinCrossBlock(2*N, 2*N, 16, self.window_size, 0)
+        if use_weight_in_decoder:
+            # for b
+            self.layer1_b = ResidualBlockUpsample(M, 2*N, 2)
+            self.m1_b = nn.Sequential(*[ConvTransBlock(dim, dim, self.head_dim[3], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') for i in range(config[3])])
+            self.up1_b = ResidualBlockUpsample(2*N, 2*N, 2)
+            self.m2_b = nn.Sequential(*[ConvTransBlock(dim, dim, self.head_dim[4], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') for i in range(config[4])])
+            self.up2_b = ResidualBlockUpsample(2*N, 2*N, 2)
+            self.m3_b = nn.Sequential(*[ConvTransBlock(dim, dim, self.head_dim[5], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') for i in range(config[5])])
+            self.up3_b = subpel_conv3x3(2*N, 3, 2)
+            
+            # cross attn
+            self.cross1 = SwinCrossBlock(2*N, 2*N, 16, self.window_size, 0)
+            self.cross2 = SwinCrossBlock(2*N, 2*N, 16, self.window_size, 0)
+            self.cross3 = SwinCrossBlock(2*N, 2*N, 16, self.window_size, 0)
     
-    def forward(self, x):
+    def forward(self, x, b=None):
         # layer 1
         x = self.layer1(x)
+        if b is not None:
+            b = self.layer1_b(b)
         for idx in range(1, 4):
             # m
             x = eval(f"self.m{idx}")(x)
-            # cross
-            x = eval(f"self.cross{idx}")(x)
+            if b is not None:
+                b = eval(f"self.m{idx}_b")(b)
+                # cross
+                x = eval(f"self.cross{idx}")(x, b)
+                # up
+                b = eval(f"self.up{idx}_b")(b)
             # up
             x = eval(f"self.up{idx}")(x)
         
-        return x
+        return x, b
 
 class TCMWeighted(CompressionModel):
     def __init__(self, config=[2, 2, 2, 2, 2, 2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0, N=128,  M=320, num_slices=5, max_support_slices=5, **kwargs):
@@ -391,6 +420,8 @@ class TCMWeighted(CompressionModel):
         self.window_size = 8
         self.num_slices = num_slices
         self.max_support_slices = max_support_slices
+        self.use_weight_in_decoder = kwargs.get('use_weight_in_decoder', 0)
+
         dim = N
         self.M = M
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(config))]
@@ -398,7 +429,7 @@ class TCMWeighted(CompressionModel):
 
         self.g_a = GA(config, head_dim, self.window_size, drop_path_rate, N, M)
 
-        self.g_s = GS(config, head_dim, self.window_size, drop_path_rate, N, M)
+        self.g_s = GS(config, head_dim, self.window_size, drop_path_rate, N, M, self.use_weight_in_decoder)
 
         self.ha_down1 = [ConvTransBlock(N, N, 32, 4, 0, 'W' if not i%2 else 'SW') 
                       for i in range(config[0])] + \
@@ -469,7 +500,8 @@ class TCMWeighted(CompressionModel):
         )
 
         self.entropy_bottleneck = EntropyBottleneck(192)
-        self.entropy_bottleneck_b = EntropyBottleneck(M)
+        if self.use_weight_in_decoder:
+            self.entropy_bottleneck_b = EntropyBottleneck(M)
         self.gaussian_conditional = GaussianConditional(None)
 
         self.freeze_pretrained_modules = False
@@ -508,9 +540,7 @@ class TCMWeighted(CompressionModel):
         return updated
     
     def forward(self, x, b):
-        batch_size = x.shape[0]
-        y = self.g_a(torch.cat([x, b], dim=0))
-        y, y_b = y[:batch_size], y[batch_size:]
+        y, y_b = self.g_a(x, b)
         y_shape = y.shape[2:]
         z = self.h_a(y)
         _, z_likelihoods = self.entropy_bottleneck(z)
@@ -519,11 +549,14 @@ class TCMWeighted(CompressionModel):
         z_tmp = z - z_offset
         z_hat = ste_round(z_tmp) + z_offset
 
-        _, y_b_likelihoods = self.entropy_bottleneck_b(y_b)
+        if self.use_weight_in_decoder:
+            _, y_b_likelihoods = self.entropy_bottleneck_b(y_b)
 
-        y_b_offset = self.entropy_bottleneck_b._get_medians()
-        y_b_tmp = y_b - y_b_offset
-        y_b_hat = ste_round(y_b_tmp) + y_b_offset
+            y_b_offset = self.entropy_bottleneck_b._get_medians()
+            y_b_tmp = y_b - y_b_offset
+            y_b_hat = ste_round(y_b_tmp) + y_b_offset
+        else:
+            y_b_hat = None
 
         latent_scales = self.h_scale_s(z_hat)
         latent_means = self.h_mean_s(z_hat)
@@ -562,12 +595,15 @@ class TCMWeighted(CompressionModel):
         means = torch.cat(mu_list, dim=1)
         scales = torch.cat(scale_list, dim=1)
         y_likelihoods = torch.cat(y_likelihood, dim=1)
-        x_hat = self.g_s(torch.cat([y_hat, y_b_hat], dim=0))
-        x_hat = x_hat[:batch_size]
+        x_hat, _ = self.g_s(y_hat, y_b_hat)
+        if self.use_weight_in_decoder:
+            likelihoods = {"y": y_likelihoods, "z": z_likelihoods, "y_b": y_b_likelihoods}
+        else:
+            likelihoods = {"y": y_likelihoods, "z": z_likelihoods}
 
         return {
             "x_hat": x_hat,
-            "likelihoods": {"y": y_likelihoods, "z": z_likelihoods, "y_b": y_b_likelihoods},
+            "likelihoods": likelihoods,
             "para":{"means": means, "scales":scales, "y":y}
         }
 
@@ -591,18 +627,17 @@ class TCMWeighted(CompressionModel):
         net.load_state_dict(state_dict)
         return net
 
-    def compress(self, x):
+    def compress(self, x, b):
         batch_size = x.shape[0]
-        y = self.g_a(torch.cat([x, b], dim=0))
-        y, y_b = y[:batch_size], y[batch_size:]
+        y, y_b = self.g_a(x, b)
         y_shape = y.shape[2:]
 
         z = self.h_a(y)
         z_strings = self.entropy_bottleneck.compress(z)
         z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
 
-        y_b_strings = self.entropy_bottleneck_b.compress(y_b)
-        y_b_hat = self.entropy_bottleneck.decompress(y_b_strings, y_b.size()[-2:])
+        if self.use_weight_in_decoder:
+            y_b_strings = self.entropy_bottleneck_b.compress(y_b)
 
         latent_scales = self.h_scale_s(z_hat)
         latent_means = self.h_mean_s(z_hat)
@@ -655,8 +690,13 @@ class TCMWeighted(CompressionModel):
         y_string = encoder.flush()
         y_strings.append(y_string)
 
-        return {"strings": [y_strings, z_strings, y_b_strings], "shape": [z.size()[-2:], y_b.size()[-2:]]}
-
+        if self.use_weight_in_decoder:
+            strings = [y_strings, z_strings, y_b_strings]
+            shape = [z.size()[-2:], y_b.size()[-2:]]
+        else:
+            strings = [y_strings, z_strings]
+            shape = z.size()[-2:]
+        return {"strings": strings, "shape": shape}
 
     def _likelihood(self, inputs, scales, means=None):
         half = float(0.5)
@@ -679,8 +719,12 @@ class TCMWeighted(CompressionModel):
         return half * torch.erfc(const * inputs)
 
     def decompress(self, strings, shape):
-        z_hat = self.entropy_bottleneck.decompress(strings[1], shape[0]) 
-        y_b_hat = self.entropy_bottleneck_b.decompress(strings[2], shape[1])
+        if self.use_weight_in_decoder:
+            z_hat = self.entropy_bottleneck.decompress(strings[1], shape[0]) 
+            y_b_hat = self.entropy_bottleneck_b.decompress(strings[2], shape[1])
+        else:
+            z_hat = self.entropy_bottleneck.decompress(strings[1], shape)
+            y_b_hat = None
         latent_scales = self.h_scale_s(z_hat)
         latent_means = self.h_mean_s(z_hat)
 
@@ -722,7 +766,6 @@ class TCMWeighted(CompressionModel):
             y_hat_slices.append(y_hat_slice)
 
         y_hat = torch.cat(y_hat_slices, dim=1)
-        x_hat = self.g_s(torch.cat([y_hat, y_b_hat], dim=0)).clamp_(0, 1)
-        x_hat = x_hat[:batch_size]
+        x_hat, _ = self.g_s(y_hat, y_b_hat)
 
         return {"x_hat": x_hat}
