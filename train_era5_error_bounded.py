@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 
 from models import TCM, TCMWeighted 
 from era5_dataset import Era5ReanalysisDatasetSingleLevel
+from torch.utils.data import DataLoader
 
 class CustomDataParallel(nn.DataParallel):
   """Custom DataParallel to access the module methods."""
@@ -85,30 +86,34 @@ class ErrorBoundedRateOnlyLoss(nn.Module):
       "failed_value_ratio": failed_value_ratio,
     }
 
-def normalize_batch_np(data, spread):
+def normalize_batch(data, spread):
+  """Normalize batch of tensors."""
   ndim = data.ndim
   batch_size = data.shape[0]
   data_flat = data.reshape(batch_size, -1)
-  mins = np.nanmin(data_flat, axis=1)
-  maxs = np.nanmax(data_flat, axis=1)
-  scales = maxs - mins # [B]
-  scales = np.where(scales == 0, 1.0, scales) # if const
+  
+  # Use nanquantile for min/max to handle NaN values
+  mins = torch.nanquantile(data_flat, 0.0, dim=1)
+  maxs = torch.nanquantile(data_flat, 1.0, dim=1)
+  scales = maxs - mins  # [B]
+  scales = torch.where(scales == 0, torch.ones_like(scales), scales)  # if const
 
-  view_shape = (batch_size, ) + (1, ) * (ndim -1)
-  data_norm = (data - mins.reshape(view_shape)) / scales.reshape(view_shape)
-  spread_norm = spread / scales.reshape(view_shape)
+  view_shape = (batch_size, ) + (1, ) * (ndim - 1)
+  data_norm = (data - mins.view(view_shape)) / scales.view(view_shape)
+  spread_norm = spread / scales.view(view_shape)
 
-  data_norm = np.where(np.isnan(data_norm), 0.0, data_norm)
-  spread_norm = np.where(np.isnan(spread_norm), 1.0, spread_norm)
-  spread_norm[spread_norm < 0] = 0
+  data_norm = torch.where(torch.isnan(data_norm), torch.zeros_like(data_norm), data_norm)
+  spread_norm = torch.where(torch.isnan(spread_norm), torch.ones_like(spread_norm), spread_norm)
+  spread_norm = torch.clamp(spread_norm, min=0)
 
   return data_norm, spread_norm, mins, scales
 
-def denormalize_batch_np(data_norm, mins, scales):
+def denormalize_batch(data_norm, mins, scales):
+  """Denormalize batch of tensors."""
   ndim = data_norm.ndim
   batch_size = data_norm.shape[0]
-  view_shape = (batch_size, ) + (1, ) * (ndim -1)
-  data = data_norm * scales.reshape(view_shape) + mins.reshape(view_shape)
+  view_shape = (batch_size, ) + (1, ) * (ndim - 1)
+  data = data_norm * scales.view(view_shape) + mins.view(view_shape)
   return data
 
 class AverageMeter:
@@ -162,7 +167,8 @@ def configure_optimizers(net, learning_rate, aux_learning_rate):
 def train_one_epoch(
   model, 
   criterion, 
-  train_dataset, 
+  train_dataloader_iter, 
+  train_dataloader,
   batch_per_epoch,
   optimizer, 
   aux_optimizer, 
@@ -176,31 +182,36 @@ def train_one_epoch(
 
   batch_idx = 0
   while True:
-    data_array, spread_array, is_epoch_finished = train_dataset.sample_batch()
+    try:
+      data_tensor, spread_tensor = next(train_dataloader_iter)
+    except StopIteration:
+      # Iterator exhausted, create a new one
+      train_dataloader_iter = iter(train_dataloader)
+      data_tensor, spread_tensor = next(train_dataloader_iter)
+    
+    data_tensor = data_tensor.to(device)
+    spread_tensor = spread_tensor.to(device)
 
-    data_norm, spread_norm, mins, scales = normalize_batch_np(data_array, spread_array)
+    data_norm, spread_norm, mins, scales = normalize_batch(data_tensor, spread_tensor)
 
-    data_tensor = torch.from_numpy(data_norm).float().to(device)
-    spread_tensor = torch.from_numpy(spread_norm).float().to(device)
-
-    data_tensor = data_tensor.unsqueeze(1).repeat(1, 3, 1, 1)
-    spread_tensor = spread_tensor.unsqueeze(1).repeat(1, 3, 1, 1)
+    data_norm = data_norm.unsqueeze(1).repeat(1, 3, 1, 1)
+    spread_norm = spread_norm.unsqueeze(1).repeat(1, 3, 1, 1)
 
     optimizer.zero_grad()
     aux_optimizer.zero_grad()
 
     if model_cls_name == "TCM":
-      out_net = model(data_tensor)
+      out_net = model(data_norm)
     elif model_cls_name == "TCMWeighted":
-      out_net = model(data_tensor, spread_tensor)
+      out_net = model(data_norm, spread_norm)
     else:
       raise ValueError(f"Unsupported model class name: {model_cls_name}")
 
     out_net["x_hat"] = out_net["x_hat"].mean(dim=1)
     out_criterion = criterion(
       out=out_net, 
-      inp=data_tensor[:, 0, :, :], 
-      target=spread_tensor[:, 0, :, :],
+      inp=data_norm[:, 0, :, :], 
+      target=spread_norm[:, 0, :, :],
     )
     out_criterion["loss"].backward()
 
@@ -225,17 +236,15 @@ def train_one_epoch(
 
     # end of epoch
     batch_idx += 1
-    if batch_per_epoch < 0:
-      if is_epoch_finished:
-        break
-    else:
-      if batch_idx >= batch_per_epoch:
-        break
+    if batch_per_epoch > 0 and batch_idx >= batch_per_epoch:
+      break
+  
+  return train_dataloader_iter
 
 def valid_epoch(
   model, 
   criterion,
-  valid_dataset,
+  valid_dataloader,
   epoch,
   interval,
 ):
@@ -248,25 +257,25 @@ def valid_epoch(
 
   batch_idx = 0
   with torch.no_grad():
-    while True:
-      data_array, spread_array, is_epoch_finished = valid_dataset.sample_batch()
-      data_array = data_array[::interval]
-      spread_array = spread_array[::interval]
+    for data_tensor, spread_tensor in valid_dataloader:
+      if interval > 1:
+        data_tensor = data_tensor[::interval]
+        spread_tensor = spread_tensor[::interval]
 
-      data_norm, spread_norm, mins, scales = normalize_batch_np(data_array, spread_array)
+      data_tensor = data_tensor.to(device)
+      spread_tensor = spread_tensor.to(device)
 
-      data_tensor = torch.from_numpy(data_norm).float().to(device)
-      spread_tensor = torch.from_numpy(spread_norm).float().to(device)
+      data_norm, spread_norm, mins, scales = normalize_batch(data_tensor, spread_tensor)
 
-      data_tensor = data_tensor.unsqueeze(1).repeat(1, 3, 1, 1)
-      spread_tensor = spread_tensor.unsqueeze(1).repeat(1, 3, 1, 1)
+      data_norm = data_norm.unsqueeze(1).repeat(1, 3, 1, 1)
+      spread_norm = spread_norm.unsqueeze(1).repeat(1, 3, 1, 1)
 
       if model_cls_name == "TCM":
-        out_net = model(data_tensor)
-        out_enc = model.compress(data_tensor)
+        out_net = model(data_norm)
+        out_enc = model.compress(data_norm)
       elif model_cls_name == "TCMWeighted":
-        out_net = model(data_tensor, spread_tensor)
-        out_enc = model.compress(data_tensor, spread_tensor)
+        out_net = model(data_norm, spread_norm)
+        out_enc = model.compress(data_norm, spread_norm)
       else:
         raise ValueError(f"Unsupported model class name: {model_cls_name}")
 
@@ -274,8 +283,8 @@ def valid_epoch(
       out_net["x_hat"] = out_net["x_hat"].mean(dim=1)
       out_criterion = criterion(
         out=out_net, 
-        inp=data_tensor[:, 0, :, :], 
-        target=spread_tensor[:, 0, :, :],
+        inp=data_norm[:, 0, :, :], 
+        target=spread_norm[:, 0, :, :],
       )
 
       avg_metrics.setdefault("loss", AverageMeter()).update(out_criterion["loss"].item())
@@ -289,11 +298,15 @@ def valid_epoch(
       out_dec = model.decompress(out_enc["strings"], out_enc["shape"])
       out_dec["x_hat"] = out_dec["x_hat"].mean(dim=1)
 
-      data_hat = denormalize_batch_np(out_dec["x_hat"].detach().cpu().numpy(), mins, scales)
-      error = np.abs(data_hat - data_array)
-      fail_mask = error > spread_array
+      data_hat = denormalize_batch(out_dec["x_hat"], mins, scales)
+      data_hat_np = data_hat.cpu().numpy()
+      data_tensor_np = data_tensor.cpu().numpy()
+      spread_tensor_np = spread_tensor.cpu().numpy()
+      
+      error = np.abs(data_hat_np - data_tensor_np)
+      fail_mask = error > spread_tensor_np
       fail_idx = np.flatnonzero(fail_mask).astype(np.int32)
-      fail_val = data_array.flat[fail_idx]
+      fail_val = data_tensor_np.flat[fail_idx]
       packed_fail_mask = np.packbits(fail_mask.ravel())
       compressed_fail_mask = zlib.compress(packed_fail_mask.tobytes(), level=6)
       compressed_fail_idx = zlib.compress(fail_idx.tobytes(), level=6)
@@ -312,11 +325,11 @@ def valid_epoch(
           "fail_val": compressed_fail_val,
         }
 
-      failed_value_compression_ratio = fail_val.nbytes / failed_value_compressed_size_bytes
+      failed_value_compression_ratio = fail_val.nbytes / failed_value_compressed_size_bytes if failed_value_compressed_size_bytes > 0 else float('inf')
       compressed_bitstream = pickle.dumps([compressed_fail_info, out_enc])
-      data_size_bytes = data_array.nbytes
+      data_size_bytes = data_tensor_np.nbytes
       compressed_size_bytes = len(compressed_bitstream)
-      real_bpp = (compressed_size_bytes * 8) / np.prod(data_array.shape)
+      real_bpp = (compressed_size_bytes * 8) / np.prod(data_tensor_np.shape)
       real_compression_ratio = data_size_bytes / compressed_size_bytes
 
       avg_metrics.setdefault("real_compression_ratio", AverageMeter()).update(real_compression_ratio)
@@ -337,8 +350,6 @@ def valid_epoch(
       )
 
       batch_idx += 1
-      if is_epoch_finished:
-        break
 
   result = {
     "epoch": epoch,
@@ -443,36 +454,45 @@ def main(argv):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-  save_path = os.path.join(args.save_path, f"{args.model}_N_{args.N}_bd_{args.use_bound_in_decoder}_var_{args.variable}_score_{args.score_type}_surrogate_{args.surrogate_loss_type}_tau_{args.tau}_seed_{args.seed}")
+  save_path = os.path.join(args.save_path, f"N_{args.N}_bd_{args.use_bound_in_decoder}_var_{args.variable}_score_{args.score_type}_surrogate_{args.surrogate_loss_type}_tau_{args.tau}_seed_{args.seed}")
   if not os.path.exists(save_path):
     os.makedirs(save_path)
 
   # datasets
   patch_size = -1
   padding_factor = 128
-  n_files_per_load = 4
-  loader_mode = 'thread'
   train_dataset = Era5ReanalysisDatasetSingleLevel(
     variable=args.variable,
-    batch_size=args.batch_size,
+    split="train",
     patch_size=patch_size,
     padding_factor=padding_factor,
-    split="train",
-    n_files_per_load=n_files_per_load,
-    loader_mode=loader_mode,
+  )
+
+  valid_dataset = Era5ReanalysisDatasetSingleLevel(
+    variable=args.variable,
+    split="valid",
+    patch_size=-1,
+    padding_factor=padding_factor,
+  )
+
+  # dataloaders (shuffle=False to continue from where we left off when batch_per_epoch is used)
+  train_dataloader = DataLoader(
+    train_dataset,
+    batch_size=args.batch_size,
+    shuffle=False,
+    num_workers=8,
+    drop_last=False,
   )
 
   valid_batch_size = 420
   interval = 42
 
-  valid_dataset = Era5ReanalysisDatasetSingleLevel(
-    variable=args.variable,
+  valid_dataloader = DataLoader(
+    valid_dataset,
     batch_size=valid_batch_size,
-    patch_size=-1,
-    padding_factor=padding_factor,
-    split="valid",
-    n_files_per_load=n_files_per_load,
-    loader_mode=loader_mode,
+    shuffle=False,
+    num_workers=8,
+    drop_last=False,
   )
 
   device = 'cuda:0'
@@ -555,12 +575,17 @@ def main(argv):
 
   best_loss = float("inf")
   results = []
+  
+  # Create persistent iterator for training (to continue across epochs when batch_per_epoch is used)
+  train_dataloader_iter = iter(train_dataloader)
+  
   for epoch in range(last_epoch, args.epochs):
     print(f"Learning rate: {optimizer.param_groups[0]['lr']}")
-    train_one_epoch(
+    train_dataloader_iter = train_one_epoch(
       model=net, 
       criterion=criterion, 
-      train_dataset=train_dataset, 
+      train_dataloader_iter=train_dataloader_iter,
+      train_dataloader=train_dataloader,
       batch_per_epoch=args.batch_per_epoch,
       optimizer=optimizer, 
       aux_optimizer=aux_optimizer, 
@@ -571,7 +596,7 @@ def main(argv):
     result = valid_epoch(
       model=net, 
       criterion=criterion,
-      valid_dataset=valid_dataset,
+      valid_dataloader=valid_dataloader,
       epoch=epoch,
       interval=interval,
     )
