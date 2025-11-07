@@ -1,8 +1,8 @@
 import os
 import math
-import fire
+import argparse
+import sys
 import random
-import inspect
 import pickle
 import zlib
 
@@ -74,7 +74,7 @@ class ErrorBoundedRateOnlyLoss(nn.Module):
     else:
       raise ValueError(f"Unsupported surrogate_loss_type {self.surrogate_loss_type}")
 
-    bpp_failed_value = 32 * is_failed_value.mean() # 32b for float32
+    bpp_failed_value = 1.8 * 32 * is_failed_value.mean() # 32b for float32, normally 1.8x factor with zlib
 
     loss = bpp_compression + bpp_failed_value
 
@@ -172,6 +172,7 @@ def train_one_epoch(
 ):
   model.train()
   device = next(model.parameters()).device
+  model_cls_name = model.module.__class__.__name__ if isinstance(model, torch.nn.DataParallel) else model.__class__.__name__
 
   batch_idx = 0
   while True:
@@ -188,14 +189,13 @@ def train_one_epoch(
     optimizer.zero_grad()
     aux_optimizer.zero_grad()
 
-    num_params = len(inspect.signature(model.forward).parameters)
-    if num_params == 1:
+    if model_cls_name == "TCM":
       out_net = model(data_tensor)
-    elif num_params == 2:
+    elif model_cls_name == "TCMWeighted":
       out_net = model(data_tensor, spread_tensor)
     else:
-      raise ValueError(f"Unsupported number of model.forward parameters: {num_params}")
-    
+      raise ValueError(f"Unsupported model class name: {model_cls_name}")
+
     out_net["x_hat"] = out_net["x_hat"].mean(dim=1)
     out_criterion = criterion(
       out=out_net, 
@@ -215,7 +215,7 @@ def train_one_epoch(
 
     print(
       f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
-      f" Train epoch {epoch} batch {batch_idx}: {data_array.shape}"
+      f" Train epoch {epoch} batch {batch_idx}:"
       f' Loss: {out_criterion["loss"].item()} |'
       f' Bpp Compression: {out_criterion["bpp_compression"]} |'
       f' Bpp Failed Value: {out_criterion["bpp_failed_value"]} |'
@@ -240,10 +240,13 @@ def valid_epoch(
   interval,
 ):
   model.eval()
+  model.update()
   device = next(model.parameters()).device
+  model_cls_name = model.module.__class__.__name__ if isinstance(model, torch.nn.DataParallel) else model.__class__.__name__
 
   avg_metrics = {}
 
+  batch_idx = 0
   with torch.no_grad():
     while True:
       data_array, spread_array, is_epoch_finished = valid_dataset.sample_batch()
@@ -258,15 +261,14 @@ def valid_epoch(
       data_tensor = data_tensor.unsqueeze(1).repeat(1, 3, 1, 1)
       spread_tensor = spread_tensor.unsqueeze(1).repeat(1, 3, 1, 1)
 
-      num_params = len(inspect.signature(model.forward).parameters)
-      if num_params == 1:
+      if model_cls_name == "TCM":
         out_net = model(data_tensor)
         out_enc = model.compress(data_tensor)
-      elif num_params == 2:
+      elif model_cls_name == "TCMWeighted":
         out_net = model(data_tensor, spread_tensor)
         out_enc = model.compress(data_tensor, spread_tensor)
       else:
-        raise ValueError(f"Unsupported number of model.forward parameters: {num_params}")
+        raise ValueError(f"Unsupported model class name: {model_cls_name}")
 
       # inference
       out_net["x_hat"] = out_net["x_hat"].mean(dim=1)
@@ -321,12 +323,26 @@ def valid_epoch(
       avg_metrics.setdefault("real_bpp", AverageMeter()).update(real_bpp)
       avg_metrics.setdefault("real_failed_value_compression_ratio", AverageMeter()).update(failed_value_compression_ratio)
 
+      print(
+        f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
+        f" Valid epoch {epoch} batch {batch_idx}:"
+        f" Loss: {avg_metrics['loss'].val} |"
+        f' Bpp Compression: {avg_metrics["bpp_compression"].val} |'
+        f' Bpp Failed Value: {avg_metrics["bpp_failed_value"].val} |'
+        f' Failed Value Ratio: {avg_metrics["failed_value_ratio"].val} |'
+        f" Aux loss: {avg_metrics['aux_loss'].val}"
+        f' Real Compression Ratio: {avg_metrics["real_compression_ratio"].val} |'
+        f' Real Bpp: {avg_metrics["real_bpp"].val} |'
+        f' Real Failed Value Compression Ratio: {avg_metrics["real_failed_value_compression_ratio"].val}'
+      )
+
+      batch_idx += 1
       if is_epoch_finished:
         break
 
   result = {
     "epoch": epoch,
-    k: v.avg for k, v in avg_metrics.items(),
+    **{k: v.avg for k, v in avg_metrics.items()},
   }
 
   print(
@@ -336,7 +352,7 @@ def valid_epoch(
     f' Bpp Compression: {result["bpp_compression"]} |'
     f' Bpp Failed Value: {result["bpp_failed_value"]} |'
     f' Failed Value Ratio: {result["failed_value_ratio"]} |'
-    f" Aux loss: {avg_metrics['aux_loss']}"
+    f" Aux loss: {result['aux_loss']}"
     f' Real Compression Ratio: {result["real_compression_ratio"]} |'
     f' Real Bpp: {result["real_bpp"]} |'
     f' Real Failed Value Compression Ratio: {result["real_failed_value_compression_ratio"]}'
@@ -353,38 +369,81 @@ def save_checkpoint(state, is_best, epoch, save_path, filename):
     torch.save(state, os.path.join(save_path, "checkpoint_best.pth.tar"))
 
 
-def main(
+def parse_args(argv):
+  parser = argparse.ArgumentParser(description="Era5 error bounded training script.")
   # model
-  model,
-  N,
-  use_bound_in_decoder,
+  parser.add_argument(
+    "--model", type=str, required=True, choices=['tcm', 'tcm_weighted'], help="Model architecture"
+  )
+  parser.add_argument(
+    "--N", type=int, default=128, help="Number of channels"
+  )
+  parser.add_argument(
+    "--use-bound-in-decoder", type=int, default=0, help="Use bound in decoder"
+  )
   # dataset
-  variable,
+  parser.add_argument(
+    "--variable", type=str, required=True, help="ERA5 Variable"
+  )
   # training
-  epochs,
-  batch_size,
-  batch_per_epoch,
-  learning_rate,
-  clip_max_norm,
-  lr_epoch,
+  parser.add_argument(
+    "--epochs", default=50, type=int, help="Number of epochs (default: %(default)s)"
+  )
+  parser.add_argument(
+    "--batch-size", type=int, default=8, help="Batch size (default: %(default)s)"
+  )
+  parser.add_argument(
+    "--batch-per-epoch", type=int, default=-1, help="Batches per epoch (-1 for full epoch)"
+  )
+  parser.add_argument(
+    "--learning-rate", default=1e-4, type=float, help="Learning rate (default: %(default)s)"
+  )
+  parser.add_argument(
+    "--clip-max-norm", default=1.0, type=float, help="gradient clipping max norm (default: %(default)s)"
+  )
+  parser.add_argument(
+    "--lr-epoch", nargs='+', type=int, help="Learning rate schedule milestones"
+  )
   # loss
-  score_type,
-  surrogate_loss_type,
-  tau,
+  parser.add_argument(
+    "--score-type", type=str, required=True, choices=['ratio', 'margin'], help="Score type for error bounded loss"
+  )
+  parser.add_argument(
+    "--surrogate-loss-type", type=str, required=True, choices=['relu', 'relu_square', 'softplus', 'sigmoid'], help="Surrogate loss type"
+  )
+  parser.add_argument(
+    "--tau", type=float, required=True, help="Tau parameter for surrogate loss"
+  )
   # ckpt
-  save_path,
-  checkpoint=None,
-  continue_train=False,
-  freeze_pretrained_modules=False,
-  seed=42,
-):
-  aux_learning_rate = 1e-3
-  if seed is not None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+  parser.add_argument(
+    "--save-path", type=str, required=True, help="Path to save checkpoints"
+  )
+  parser.add_argument(
+    "--checkpoint", type=str, help="Path to a checkpoint"
+  )
+  parser.add_argument(
+    "--continue-train", action="store_true", help="Continue training from checkpoint"
+  )
+  parser.add_argument(
+    "--freeze-pretrained-modules", action="store_true", help="Freeze pretrained modules"
+  )
+  parser.add_argument(
+    "--seed", type=int, default=42, help="Set random seed for reproducibility"
+  )
+  args = parser.parse_args(argv)
+  return args
 
-  save_path = os.path.join(save_path, f"N_{N}_model_{model}_var_{variable}_score_{score_type}_surrogate_{surrogate_loss_type}_tau_{tau}_lr_{learning_rate}_bs_{batch_size}_seed_{seed}")
+def main(argv):
+  args = parse_args(argv)
+  for arg in vars(args):
+    print(arg, ":", getattr(args, arg))
+  aux_learning_rate = 1e-3
+  if args.seed is not None:
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+  save_path = os.path.join(args.save_path, f"{args.model}_N_{args.N}_bd_{args.use_bound_in_decoder}_var_{args.variable}_score_{args.score_type}_surrogate_{args.surrogate_loss_type}_tau_{args.tau}_seed_{args.seed}")
   if not os.path.exists(save_path):
     os.makedirs(save_path)
 
@@ -394,8 +453,8 @@ def main(
   n_files_per_load = 4
   loader_mode = 'thread'
   train_dataset = Era5ReanalysisDatasetSingleLevel(
-    variable=variable,
-    batch_size=batch_size,
+    variable=args.variable,
+    batch_size=args.batch_size,
     patch_size=patch_size,
     padding_factor=padding_factor,
     split="train",
@@ -403,9 +462,12 @@ def main(
     loader_mode=loader_mode,
   )
 
+  valid_batch_size = 420
+  interval = 42
+
   valid_dataset = Era5ReanalysisDatasetSingleLevel(
-    variable=variable,
-    batch_size=60,
+    variable=args.variable,
+    batch_size=valid_batch_size,
     patch_size=-1,
     padding_factor=padding_factor,
     split="valid",
@@ -415,69 +477,69 @@ def main(
 
   device = 'cuda:0'
 
-  if model == 'tcm':
+  if args.model == 'tcm':
     print("[INFO] Using TCM model")
     net = TCM(
       config=[2,2,2,2,2,2], 
       head_dim=[8, 16, 32, 32, 16, 8], 
       drop_path_rate=0.0, 
-      N=N, 
+      N=args.N, 
       M=320
     )
-  elif model == 'tcm_weighted':
+  elif args.model == 'tcm_weighted':
     print("[INFO] Using TCMWeighted model")
     net = TCMWeighted(
       config=[2,2,2,2,2,2], 
       head_dim=[8, 16, 32, 32, 16, 8], 
       drop_path_rate=0.0, 
-      N=N, 
+      N=args.N, 
       M=320, 
-      use_bound_in_decoder=use_bound_in_decoder
+      use_bound_in_decoder=args.use_bound_in_decoder
     )
   else:
-    raise ValueError(f"Unsupported model {model}")
+    raise ValueError(f"Unsupported model {args.model}")
 
   # freeze pretrained modules
-  if freeze_pretrained_modules:
-    assert model == 'TCMWeighted', "Only TCMWeighted model supports freezing pretrained modules"
+  if args.freeze_pretrained_modules:
+    assert args.model == 'tcm_weighted', "Only TCMWeighted model supports freezing pretrained modules"
     print("[INFO] Pretrained modules are freezed")
     net.freeze_pretrained_modules = True
   net = net.to(device)
 
-  optimizer, aux_optimizer = configure_optimizers(net, learning_rate, aux_learning_rate)
-  milestones = lr_epoch
+  optimizer, aux_optimizer = configure_optimizers(net, args.learning_rate, aux_learning_rate)
+  milestones = args.lr_epoch
   print("milestones: ", milestones)
   lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma=0.1, last_epoch=-1)
 
-  criterion = ErrorBoundedRateOnlyLoss(score_type, surrogate_loss_type, tau)
+  criterion = ErrorBoundedRateOnlyLoss(args.score_type, args.surrogate_loss_type, args.tau)
   criterion = criterion.to(device)
 
   last_epoch = 0
-  if checkpoint:
-    checkpoint = torch.load(checkpoint, map_location=device)
+  if args.checkpoint:
+    checkpoint = torch.load(args.checkpoint, map_location=device)
     # handle DP
     dictory = {}
     for k, v in checkpoint["state_dict"].items():
       dictory[k.replace("module.", "")] = v
     net.load_state_dict(dictory)
 
-    if continue_train:
+    if args.continue_train:
       last_epoch = checkpoint["epoch"] + 1
       optimizer.load_state_dict(checkpoint["optimizer"])
       aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
       lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
-    else:
-      save_checkpoint(
-        {
-          "epoch": -1,
-          "state_dict": net.state_dict(),
-        },
-        False,
-        -1,
-        save_path,
-        f"-1_checkpoint.pth.tar",
-      )
-    print(f"Loaded {checkpoint} and continue train from epoch {last_epoch}, ({continue_train=})")
+    # else:
+    #   save_checkpoint(
+    #     {
+    #       "epoch": -1,
+    #       "state_dict": net.state_dict(),
+    #     },
+    #     False,
+    #     -1,
+    #     save_path,
+    #     f"-1_checkpoint.pth.tar",
+    #   )
+    print(f"Loaded {args.checkpoint} and continue train from epoch {last_epoch}, ({args.continue_train=})")
   else:
     print("Training from scratch")
 
@@ -485,25 +547,25 @@ def main(
     net = CustomDataParallel(net)
     print(f'[INFO] DataParallel: Using {torch.cuda.device_count()} GPUs') 
 
-  if model == 'tcm_weighted':
-    no_aux_loss = freeze_pretrained_modules and not use_bound_in_decoder
+  if args.model == 'tcm_weighted':
+    no_aux_loss = args.freeze_pretrained_modules and not args.use_bound_in_decoder
     print(f"[INFO] no_aux_loss: {no_aux_loss}")
   else:
     no_aux_loss = False
 
   best_loss = float("inf")
   results = []
-  for epoch in range(last_epoch, epochs):
+  for epoch in range(last_epoch, args.epochs):
     print(f"Learning rate: {optimizer.param_groups[0]['lr']}")
     train_one_epoch(
       model=net, 
       criterion=criterion, 
       train_dataset=train_dataset, 
-      batch_per_epoch=batch_per_epoch,
+      batch_per_epoch=args.batch_per_epoch,
       optimizer=optimizer, 
       aux_optimizer=aux_optimizer, 
       epoch=epoch, 
-      clip_max_norm=clip_max_norm, 
+      clip_max_norm=args.clip_max_norm, 
       no_aux_loss=no_aux_loss,
     )
     result = valid_epoch(
@@ -511,7 +573,7 @@ def main(
       criterion=criterion,
       valid_dataset=valid_dataset,
       epoch=epoch,
-      interval=6,
+      interval=interval,
     )
 
     results.append(result)
@@ -540,4 +602,4 @@ def main(
 
 
 if __name__ == "__main__":
-  fire.Fire(main)
+  main(sys.argv[1:])
