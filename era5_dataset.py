@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 
 def load_single_level_file(era5_root, product_type, year, month, variable):
   data_file = os.path.join(era5_root, f"single_level/{product_type}/{year}/{month}/{variable}.nc")
@@ -52,22 +52,23 @@ class Era5ReanalysisDatasetSingleLevel(Dataset):
     split='train',
     patch_size=256,      # size of sampled patches; -1 means full image
     padding_factor=128,  # pad to multiple of this factor; 1 => no pad
+    interval=1,
   ):
     super().__init__()
 
     # configs
     self.variable = variable
+    self.split = split
     self.patch_size = patch_size
     self.padding_factor = padding_factor
     self.padding = None
-    self.split = split
+    self.interval = interval
 
     self.era5_root = "/capstor/scratch/cscs/ljiayong/datasets/ERA5_large"
     self.npy_root = "/iopsstor/scratch/cscs/ljiayong/cache/era5_npy"
 
     if split == 'train':
-      # self.year_lst = [str(y) for y in range(2015, 2023)]
-      self.year_lst = [str(y) for y in range(2021, 2023)]
+      self.year_lst = [str(y) for y in range(2015, 2023)]
     elif split == 'valid':
       self.year_lst = [str(y) for y in range(2023, 2024)]
     elif split == 'test':
@@ -157,6 +158,8 @@ class Era5ReanalysisDatasetSingleLevel(Dataset):
     # parse worker results to build index
     for (year, month, reanalysis_path, spread_path, n_time, H, W) in results:
       assert n_time > 0, f"Invalid time dimension for {year}/{month}: {n_time}"
+      assert n_time % self.interval == 0, f"Time dimension {n_time} for {year}/{month} is not divisible by interval {self.interval}"
+      n_time = n_time // self.interval  # account for interval
 
       self.reanalysis_files.append(reanalysis_path)
       self.spread_files.append(spread_path)
@@ -213,7 +216,7 @@ class Era5ReanalysisDatasetSingleLevel(Dataset):
 
     file_idx = bisect.bisect_right(self.cumulative_starts, idx) - 1
     file_start = self.cumulative_starts[file_idx]
-    local_idx = idx - file_start
+    local_idx = (idx - file_start) * self.interval  # account for interval
     return file_idx, local_idx
 
   def _random_patch_single(self, x):
@@ -251,6 +254,70 @@ class Era5ReanalysisDatasetSingleLevel(Dataset):
 
     return data, spread
 
+class BlockFileSampler(Sampler):
+  """
+  Sampler that:
+    1) Shuffles the file order.
+    2) Partitions files into groups of up to `group_size` files.
+    3) For each group:
+      - Collects all global indices belonging to those files.
+      - Shuffles those indices.
+      - Yields them.
+  Result: at any time, the DataLoader only needs samples from at most
+  `group_size` files, but samples are still randomized within that block.
+  """
+  def __init__(self, dataset, group_size):
+    assert group_size > 0, f"group_size must be positive, got {group_size}"
+
+    self.dataset = dataset
+    self.total_samples = len(dataset)
+
+    self.n_files = len(dataset.reanalysis_files)
+    assert self.n_files > 0, "BlockFileSampler requires at least one file in the dataset."
+
+    # Never use more files in a group than exist in total
+    self.group_size = min(group_size, self.n_files)
+
+    # Shortcuts to dataset indexing info
+    self.file_starts = dataset.cumulative_starts
+    self.file_lengths = dataset.file_lengths
+
+  def __len__(self):
+    return self.total_samples
+
+  def __iter__(self):
+    """
+    One epoch:
+      - Randomize file order.
+      - Walk through files in groups of size `group_size`.
+      - For each group: gather indices, shuffle, yield.
+    """
+    # Use a fresh generator; DataLoader seeding can override this in practice
+    g = torch.Generator()
+    # Seed from torch's global RNG to avoid being deterministic across runs
+    g.manual_seed(torch.seed())
+
+    # 1) Shuffle files
+    file_order = torch.randperm(self.n_files, generator=g).tolist()
+
+    # 2) Walk files in groups
+    for start in range(0, self.n_files, self.group_size):
+      group_files = file_order[start:start + self.group_size]
+
+      # Collect all global indices from these files
+      group_indices = []
+      for fidx in group_files:
+        start_idx = self.file_starts[fidx]
+        length = self.file_lengths[fidx]
+        group_indices.extend(range(start_idx, start_idx + length))
+
+      # 3) Shuffle within this group
+      if len(group_indices) == 0:
+        continue
+
+      perm = torch.randperm(len(group_indices), generator=g).tolist()
+      for p in perm:
+        yield group_indices[p]
 
 def run_one_epoch(dataloader, split_name: str, total_expected: int):
   """
@@ -296,35 +363,40 @@ if __name__ == "__main__":
   torch.manual_seed(0)
 
   variable = "2m_temperature"
+  interval = 1  # e.g., use every 3rd sample
 
   # Example: create train / valid / test datasets
   train_dataset = Era5ReanalysisDatasetSingleLevel(
     variable=variable,
     split="train",
-    patch_size=256,
+    patch_size=-1,
     padding_factor=128,
+    interval=interval,
   )
+  train_sampler = BlockFileSampler(train_dataset, group_size=4)
 
   valid_dataset = Era5ReanalysisDatasetSingleLevel(
     variable=variable,
     split="valid",
     patch_size=-1,
     padding_factor=1,
+    interval=interval,
   )
-
+  # valid_sampler = BlockFileSampler(valid_dataset, group_size=1)
 
   train_loader = DataLoader(
     train_dataset,
     batch_size=64,
-    shuffle=False,
+    sampler=train_sampler,
     num_workers=16,
     drop_last=False,
   )
 
   valid_loader = DataLoader(
     valid_dataset,
-    batch_size=32,
+    batch_size=64,
     shuffle=False,
+    # sampler=valid_sampler,
     num_workers=16,
     drop_last=False,
   )
