@@ -359,7 +359,7 @@ class GA(nn.Module):
         return x, b
 
 class GS(nn.Module):
-    def __init__(self, config, head_dim, window_size, drop_path_rate, N, M, use_weight_in_decoder=0):
+    def __init__(self, config, head_dim, window_size, drop_path_rate, N, M, use_bound_in_decoder=0):
         super().__init__()
         self.config = config
         self.head_dim = head_dim
@@ -378,7 +378,7 @@ class GS(nn.Module):
         self.m3 = nn.Sequential(*[ConvTransBlock(dim, dim, self.head_dim[5], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') for i in range(config[5])])
         self.up3 = subpel_conv3x3(2*N, 3, 2)
 
-        if use_weight_in_decoder:
+        if use_bound_in_decoder:
             # for b
             self.layer1_b = ResidualBlockUpsample(M, 2*N, 2)
             self.m1_b = nn.Sequential(*[ConvTransBlock(dim, dim, self.head_dim[3], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') for i in range(config[3])])
@@ -420,7 +420,7 @@ class TCMWeighted(CompressionModel):
         self.window_size = 8
         self.num_slices = num_slices
         self.max_support_slices = max_support_slices
-        self.use_weight_in_decoder = kwargs.get('use_weight_in_decoder', 0)
+        self.use_bound_in_decoder = kwargs.get('use_bound_in_decoder', 0)
 
         dim = N
         self.M = M
@@ -429,7 +429,7 @@ class TCMWeighted(CompressionModel):
 
         self.g_a = GA(config, head_dim, self.window_size, drop_path_rate, N, M)
 
-        self.g_s = GS(config, head_dim, self.window_size, drop_path_rate, N, M, self.use_weight_in_decoder)
+        self.g_s = GS(config, head_dim, self.window_size, drop_path_rate, N, M, self.use_bound_in_decoder)
 
         self.ha_down1 = [ConvTransBlock(N, N, 32, 4, 0, 'W' if not i%2 else 'SW') 
                       for i in range(config[0])] + \
@@ -500,7 +500,7 @@ class TCMWeighted(CompressionModel):
         )
 
         self.entropy_bottleneck = EntropyBottleneck(192)
-        if self.use_weight_in_decoder:
+        if self.use_bound_in_decoder:
             self.entropy_bottleneck_b = EntropyBottleneck(M)
         self.gaussian_conditional = GaussianConditional(None)
 
@@ -549,7 +549,7 @@ class TCMWeighted(CompressionModel):
         z_tmp = z - z_offset
         z_hat = ste_round(z_tmp) + z_offset
 
-        if self.use_weight_in_decoder:
+        if self.use_bound_in_decoder:
             _, y_b_likelihoods = self.entropy_bottleneck_b(y_b)
 
             y_b_offset = self.entropy_bottleneck_b._get_medians()
@@ -596,7 +596,7 @@ class TCMWeighted(CompressionModel):
         scales = torch.cat(scale_list, dim=1)
         y_likelihoods = torch.cat(y_likelihood, dim=1)
         x_hat, _ = self.g_s(y_hat, y_b_hat)
-        if self.use_weight_in_decoder:
+        if self.use_bound_in_decoder:
             likelihoods = {"y": y_likelihoods, "z": z_likelihoods, "y_b": y_b_likelihoods}
         else:
             likelihoods = {"y": y_likelihoods, "z": z_likelihoods}
@@ -636,7 +636,7 @@ class TCMWeighted(CompressionModel):
         z_strings = self.entropy_bottleneck.compress(z)
         z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
 
-        if self.use_weight_in_decoder:
+        if self.use_bound_in_decoder:
             y_b_strings = self.entropy_bottleneck_b.compress(y_b)
 
         latent_scales = self.h_scale_s(z_hat)
@@ -690,7 +690,7 @@ class TCMWeighted(CompressionModel):
         y_string = encoder.flush()
         y_strings.append(y_string)
 
-        if self.use_weight_in_decoder:
+        if self.use_bound_in_decoder:
             strings = [y_strings, z_strings, y_b_strings]
             shape = [z.size()[-2:], y_b.size()[-2:]]
         else:
@@ -719,7 +719,7 @@ class TCMWeighted(CompressionModel):
         return half * torch.erfc(const * inputs)
 
     def decompress(self, strings, shape):
-        if self.use_weight_in_decoder:
+        if self.use_bound_in_decoder:
             z_hat = self.entropy_bottleneck.decompress(strings[1], shape[0]) 
             y_b_hat = self.entropy_bottleneck_b.decompress(strings[2], shape[1])
         else:
